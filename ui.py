@@ -268,6 +268,7 @@ class ScraperWorker(QThread):
                 return
 
             scraped = 0
+            new_inserts = 0
             for page in range(1, max_pages + 1):
                 if self._stop:
                     self.log.emit('Scraping gestoppt.', 'warning')
@@ -276,8 +277,9 @@ class ScraperWorker(QThread):
                 if not projects:
                     self.log.emit(f'Seite {page}: keine Projekte mehr.', 'warning')
                     break
+                page_new = 0
                 for p in projects:
-                    db.conn.execute(
+                    cur = db.conn.execute(
                         'INSERT OR IGNORE INTO projects '
                         '(title, link, company, description, keywords, '
                         'created_date, is_top_project, is_endcustomer) '
@@ -287,15 +289,22 @@ class ScraperWorker(QThread):
                          p['ist_top_projekt'], p['ist_endkundenprojekt']),
                     )
                     scraped += 1
+                    if cur.rowcount:
+                        page_new += 1
+                        new_inserts += 1
                 db.conn.commit()
-                self.log.emit(f'Seite {page}: {len(projects)} Projekte ({scraped} gesamt)', 'info')
+                self.log.emit(
+                    f'Seite {page}: {len(projects)} Projekte '
+                    f'({page_new} neu, {scraped} gesamt gesehen)', 'info')
                 if page < max_pages and not self._stop:
                     time.sleep(random.uniform(2, 4))
 
             if not self._stop:
                 matching_enabled = self.config.get('matching_enabled', True)
                 if matching_enabled:
-                    self.log.emit(f'{scraped} Projekte gespeichert. Starte Matching …', 'success')
+                    self.log.emit(
+                        f'{new_inserts} neue Projekte gespeichert ({scraped} gesehen). Starte Matching …',
+                        'success')
                     matcher = projectMatcher.ProjectMatcher(db)
                     matcher.find_matches(profile, min_score=min_score)
                     try:
@@ -309,9 +318,10 @@ class ScraperWorker(QThread):
                         pass
                 else:
                     self.log.emit(
-                        f'{scraped} Projekte gespeichert. Matching deaktiviert – alle Projekte extrahiert.',
+                        f'{new_inserts} neue Projekte gespeichert ({scraped} gesehen). '
+                        f'Matching deaktiviert – alle Projekte extrahiert.',
                         'success')
-                    self.finished.emit(scraped)
+                    self.finished.emit(new_inserts)
                     return
             self.finished.emit(0)
 
