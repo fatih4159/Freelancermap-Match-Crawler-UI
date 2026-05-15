@@ -781,33 +781,57 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'Datenbank fehlt',
                                 'Bitte zuerst den Scraper ausführen.')
             return
-        min_score = self._filter_score.value()
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute('''
-            SELECT p.id, p.title, p.company, p.keywords, p.description,
-                   p.created_date, p.link, p.is_top_project, p.is_endcustomer,
-                   m.match_score, m.match_debug
-            FROM matches m JOIN projects p ON m.project_id = p.id
-            WHERE m.match_score >= ?
-            ORDER BY m.match_score DESC
-        ''', (min_score,))
-        rows = cur.fetchall()
-        conn.close()
-        self._matches = [dict(r) for r in rows]
-        self._populate_table()
-        n = len(self._matches)
-        self._matches_count.setText(f'{n} Match{"es" if n != 1 else ""}')
-        self.statusBar().showMessage(
-            f'{n} Matches geladen (Min-Score ≥ {min_score})')
 
-    def _populate_table(self):
+        matching_enabled = self.config.get('matching_enabled', True)
+        if matching_enabled:
+            min_score = self._filter_score.value()
+            cur.execute('''
+                SELECT p.id, p.title, p.company, p.keywords, p.description,
+                       p.created_date, p.link, p.is_top_project, p.is_endcustomer,
+                       m.match_score, m.match_debug
+                FROM matches m JOIN projects p ON m.project_id = p.id
+                WHERE m.match_score >= ?
+                ORDER BY m.match_score DESC
+            ''', (min_score,))
+            rows = cur.fetchall()
+            conn.close()
+            self._matches = [dict(r) for r in rows]
+            self._populate_table(matching_enabled=True)
+            n = len(self._matches)
+            self._matches_count.setText(f'{n} Match{"es" if n != 1 else ""}')
+            self.statusBar().showMessage(
+                f'{n} Matches geladen (Min-Score ≥ {min_score})')
+        else:
+            cur.execute('''
+                SELECT id, title, company, keywords, description,
+                       created_date, link, is_top_project, is_endcustomer
+                FROM projects
+                ORDER BY created_date DESC
+            ''')
+            rows = cur.fetchall()
+            conn.close()
+            self._matches = [
+                {**dict(r), 'match_score': None, 'match_debug': ''}
+                for r in rows
+            ]
+            self._populate_table(matching_enabled=False)
+            n = len(self._matches)
+            self._matches_count.setText(f'{n} Projekt{"e" if n != 1 else ""}')
+            self.statusBar().showMessage(
+                f'{n} Projekte geladen (Matching deaktiviert – alle Ergebnisse)')
+
+    def _populate_table(self, matching_enabled=True):
         model = self._matches_model
         model.setRowCount(0)
         for m in self._matches:
             score = QStandardItem()
-            score.setData(round(m['match_score'], 1), Qt.ItemDataRole.DisplayRole)
+            if matching_enabled and m['match_score'] is not None:
+                score.setData(round(m['match_score'], 1), Qt.ItemDataRole.DisplayRole)
+            else:
+                score.setText('–')
             score.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             title   = QStandardItem(m['title'] or '')
@@ -839,9 +863,10 @@ class MainWindow(QMainWindow):
         m = self._matches[row]
         top_txt = ' ★ Top-Projekt' if m.get('is_top_project') else ''
         ec_txt  = ' ✔ Endkunde'   if m.get('is_endcustomer') else ''
+        score_txt = f"{m['match_score']:.1f}" if m.get('match_score') is not None else '– (kein Matching)'
         lines = [
             f"<b>{m['title']}</b>{top_txt}{ec_txt}",
-            f"Firma: {m['company']}   |   Score: {m['match_score']:.1f}",
+            f"Firma: {m['company']}   |   Score: {score_txt}",
             f"Keywords: {m['keywords']}",
         ]
         desc = (m.get('description') or '')[:350]
@@ -871,7 +896,7 @@ class MainWindow(QMainWindow):
             for m in self._matches:
                 w.writerow([
                     m['title'], m['company'],
-                    f"{m['match_score']:.2f}", m['keywords'],
+                    f"{m['match_score']:.2f}" if m.get('match_score') is not None else '', m['keywords'],
                     m['created_date'],
                     'Ja' if m.get('is_top_project') else 'Nein',
                     'Ja' if m.get('is_endcustomer') else 'Nein',
