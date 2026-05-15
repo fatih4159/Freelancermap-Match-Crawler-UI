@@ -12,6 +12,7 @@ import csv
 import threading
 import queue
 import sqlite3
+import traceback
 import webbrowser
 from datetime import datetime
 
@@ -174,6 +175,16 @@ class ScraperWorker(QThread):
                     pass
             self.finished.emit(0)
 
+        except ModuleNotFoundError as exc:
+            missing = exc.name or str(exc)
+            self.log.emit(
+                f'Fehler: Abhängigkeit fehlt – "{missing}" ist nicht installiert.', 'error'
+            )
+            self.log.emit(
+                'Bitte führe im Projektordner aus:  pip install -r requirements.txt',
+                'error',
+            )
+            self.finished.emit(0)
         except Exception as exc:
             self.log.emit(f'Fehler: {exc}', 'error')
             self.log.emit(traceback.format_exc(), 'error')
