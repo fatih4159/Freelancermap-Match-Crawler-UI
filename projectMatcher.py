@@ -218,12 +218,17 @@ class FreelancermapScraper:
                 if isinstance(data, list) and data and isinstance(data[0], dict) and 'title' in data[0]:
                     captured_json.extend(data)
                 elif isinstance(data, dict):
-                    # Current API format
-                    for key in ('initialTopResults', 'initialResults',
-                                'projects', 'hits', 'items', 'results', 'data'):
+                    # Collect top results AND regular results (no break between them)
+                    got = False
+                    for key in ('initialTopResults', 'initialResults'):
                         if key in data and isinstance(data[key], list) and data[key]:
                             captured_json.extend(data[key])
-                            break
+                            got = True
+                    if not got:
+                        for key in ('projects', 'hits', 'items', 'results', 'data'):
+                            if key in data and isinstance(data[key], list) and data[key]:
+                                captured_json.extend(data[key])
+                                break
             except Exception:
                 pass
 

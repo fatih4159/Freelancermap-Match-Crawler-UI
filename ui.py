@@ -268,6 +268,7 @@ class ScraperWorker(QThread):
                 return
 
             scraped = 0
+            new_inserts = 0
             for page in range(1, max_pages + 1):
                 if self._stop:
                     self.log.emit('Scraping gestoppt.', 'warning')
@@ -276,8 +277,9 @@ class ScraperWorker(QThread):
                 if not projects:
                     self.log.emit(f'Seite {page}: keine Projekte mehr.', 'warning')
                     break
+                page_new = 0
                 for p in projects:
-                    db.conn.execute(
+                    cur = db.conn.execute(
                         'INSERT OR IGNORE INTO projects '
                         '(title, link, company, description, keywords, '
                         'created_date, is_top_project, is_endcustomer) '
@@ -287,15 +289,25 @@ class ScraperWorker(QThread):
                          p['ist_top_projekt'], p['ist_endkundenprojekt']),
                     )
                     scraped += 1
+                    if cur.rowcount:
+                        page_new += 1
+                        new_inserts += 1
+                        self.log.emit(f'  [NEU]      {p["titel"]}', 'info')
+                    else:
+                        self.log.emit(f'  [DUPLIKAT] {p["titel"]}', 'warning')
                 db.conn.commit()
-                self.log.emit(f'Seite {page}: {len(projects)} Projekte ({scraped} gesamt)', 'info')
+                self.log.emit(
+                    f'Seite {page}: {len(projects)} Projekte '
+                    f'({page_new} neu, {scraped} gesamt)', 'info')
                 if page < max_pages and not self._stop:
                     time.sleep(random.uniform(2, 4))
 
             if not self._stop:
                 matching_enabled = self.config.get('matching_enabled', True)
                 if matching_enabled:
-                    self.log.emit(f'{scraped} Projekte gespeichert. Starte Matching …', 'success')
+                    self.log.emit(
+                        f'{scraped} Projekte gesehen ({new_inserts} neu). Starte Matching …',
+                        'success')
                     matcher = projectMatcher.ProjectMatcher(db)
                     matcher.find_matches(profile, min_score=min_score)
                     try:
@@ -309,7 +321,8 @@ class ScraperWorker(QThread):
                         pass
                 else:
                     self.log.emit(
-                        f'{scraped} Projekte gespeichert. Matching deaktiviert – alle Projekte extrahiert.',
+                        f'{scraped} Projekte gesehen ({new_inserts} neu gespeichert). '
+                        f'Matching deaktiviert.',
                         'success')
                     self.finished.emit(scraped)
                     return
@@ -386,6 +399,8 @@ class MainWindow(QMainWindow):
         self._matching_enabled.setToolTip(
             'Wenn deaktiviert, werden alle Projekte ohne Matching gespeichert '
             '(nützlich für reine Extraktion aller Ergebnisse).')
+        self._matching_enabled.toggled.connect(self._min_score.setEnabled)
+        self._min_score.setEnabled(self.config.get('matching_enabled', True))
         fl2.addRow('Max. Seiten:', self._max_pages)
         fl2.addRow('Min. Score (0–100):', self._min_score)
         fl2.addRow('Matching:', self._matching_enabled)
@@ -685,8 +700,13 @@ class MainWindow(QMainWindow):
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._progress.setVisible(False)
-        msg = f'Fertig – {count} Matches gefunden.' if count else 'Abgeschlossen.'
+        matching_enabled = self.config.get('matching_enabled', True)
+        if matching_enabled:
+            msg = f'Fertig – {count} Matches gefunden.' if count else 'Abgeschlossen.'
+        else:
+            msg = f'Fertig – {count} Projekte extrahiert.' if count else 'Abgeschlossen.'
         self.statusBar().showMessage(msg)
+        self._load_matches()
 
     def _append_log(self, message, level):
         colors = {
@@ -786,6 +806,7 @@ class MainWindow(QMainWindow):
         cur = conn.cursor()
 
         matching_enabled = self.config.get('matching_enabled', True)
+        self._filter_score.setEnabled(matching_enabled)
         if matching_enabled:
             min_score = self._filter_score.value()
             cur.execute('''
@@ -847,7 +868,10 @@ class MainWindow(QMainWindow):
                 item.setEditable(False)
             model.appendRow([score, title, company, kw, date, top, ec])
 
-        self._table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        if matching_enabled:
+            self._table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        else:
+            self._table.sortByColumn(4, Qt.SortOrder.DescendingOrder)
 
     def _open_in_browser(self, index):
         row = self._proxy.mapToSource(index).row()
