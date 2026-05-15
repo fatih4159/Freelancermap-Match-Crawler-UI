@@ -399,6 +399,8 @@ class MainWindow(QMainWindow):
         self._matching_enabled.setToolTip(
             'Wenn deaktiviert, werden alle Projekte ohne Matching gespeichert '
             '(nützlich für reine Extraktion aller Ergebnisse).')
+        self._matching_enabled.toggled.connect(self._min_score.setEnabled)
+        self._min_score.setEnabled(self.config.get('matching_enabled', True))
         fl2.addRow('Max. Seiten:', self._max_pages)
         fl2.addRow('Min. Score (0–100):', self._min_score)
         fl2.addRow('Matching:', self._matching_enabled)
@@ -698,8 +700,13 @@ class MainWindow(QMainWindow):
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._progress.setVisible(False)
-        msg = f'Fertig – {count} Matches gefunden.' if count else 'Abgeschlossen.'
+        matching_enabled = self.config.get('matching_enabled', True)
+        if matching_enabled:
+            msg = f'Fertig – {count} Matches gefunden.' if count else 'Abgeschlossen.'
+        else:
+            msg = f'Fertig – {count} Projekte extrahiert.' if count else 'Abgeschlossen.'
         self.statusBar().showMessage(msg)
+        self._load_matches()
 
     def _append_log(self, message, level):
         colors = {
@@ -799,6 +806,7 @@ class MainWindow(QMainWindow):
         cur = conn.cursor()
 
         matching_enabled = self.config.get('matching_enabled', True)
+        self._filter_score.setEnabled(matching_enabled)
         if matching_enabled:
             min_score = self._filter_score.value()
             cur.execute('''
@@ -860,7 +868,10 @@ class MainWindow(QMainWindow):
                 item.setEditable(False)
             model.appendRow([score, title, company, kw, date, top, ec])
 
-        self._table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        if matching_enabled:
+            self._table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        else:
+            self._table.sortByColumn(4, Qt.SortOrder.DescendingOrder)
 
     def _open_in_browser(self, index):
         row = self._proxy.mapToSource(index).row()
