@@ -292,6 +292,9 @@ class ScraperWorker(QThread):
                     if cur.rowcount:
                         page_new += 1
                         new_inserts += 1
+                        self.log.emit(f'  [NEU]      {p["titel"]}', 'info')
+                    else:
+                        self.log.emit(f'  [DUPLIKAT] {p["titel"]}', 'warning')
                 db.conn.commit()
                 self.log.emit(
                     f'Seite {page}: {len(projects)} Projekte '
