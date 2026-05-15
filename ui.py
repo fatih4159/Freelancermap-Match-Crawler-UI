@@ -295,7 +295,7 @@ class ScraperWorker(QThread):
                 db.conn.commit()
                 self.log.emit(
                     f'Seite {page}: {len(projects)} Projekte '
-                    f'({page_new} neu, {scraped} gesamt gesehen)', 'info')
+                    f'({page_new} neu, {scraped} gesamt)', 'info')
                 if page < max_pages and not self._stop:
                     time.sleep(random.uniform(2, 4))
 
@@ -303,7 +303,7 @@ class ScraperWorker(QThread):
                 matching_enabled = self.config.get('matching_enabled', True)
                 if matching_enabled:
                     self.log.emit(
-                        f'{new_inserts} neue Projekte gespeichert ({scraped} gesehen). Starte Matching …',
+                        f'{scraped} Projekte gesehen ({new_inserts} neu). Starte Matching …',
                         'success')
                     matcher = projectMatcher.ProjectMatcher(db)
                     matcher.find_matches(profile, min_score=min_score)
@@ -318,10 +318,10 @@ class ScraperWorker(QThread):
                         pass
                 else:
                     self.log.emit(
-                        f'{new_inserts} neue Projekte gespeichert ({scraped} gesehen). '
-                        f'Matching deaktiviert – alle Projekte extrahiert.',
+                        f'{scraped} Projekte gesehen ({new_inserts} neu gespeichert). '
+                        f'Matching deaktiviert.',
                         'success')
-                    self.finished.emit(new_inserts)
+                    self.finished.emit(scraped)
                     return
             self.finished.emit(0)
 
