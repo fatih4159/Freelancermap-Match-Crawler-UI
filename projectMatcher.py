@@ -340,41 +340,31 @@ class FreelancermapScraper:
             self._page.on('response', _on_resp)
             clicked = False
 
-            # Elemente existieren im DOM aber sind nicht unbedingt sichtbar.
-            # Daher: state='attached' + force=True beim Klick.
-            def _try_click(sel, label):
-                try:
-                    self._page.wait_for_selector(sel, state='attached', timeout=3000)
-                    self._page.locator(sel).first.click(force=True)
-                    print(f"  Geklickt: {label} ({sel})")
-                    return True
-                except Exception as e:
-                    print(f"  Nicht gefunden: {sel} – {str(e)[:80]}")
-                    return False
+            # Elemente sind im DOM aber nicht sichtbar – JS-Klick umgeht alle
+            # Playwright-Actionability-Checks direkt im Browser-Kontext.
+            js_result = self._page.evaluate(f'''
+                (function() {{
+                    // Direkter Seitenlink (data-page oder pagenr im href)
+                    var direct = document.querySelector(
+                        '.paginator-item[data-page="{page_number}"]'
+                    );
+                    if (!direct) {{
+                        var links = document.querySelectorAll('a[href*="pagenr={page_number}"]');
+                        direct = links.length ? links[0] : null;
+                    }}
+                    if (direct) {{ direct.click(); return "direct:{page_number}"; }}
 
-            # Bevorzuge: direkter Paginator-Link für gesuchte Seite
-            for sel in (
-                f'.paginator-item[data-page="{page_number}"]',
-                f'a[href*="pagenr={page_number}"]',
-            ):
-                if _try_click(sel, f'Seite {page_number}'):
-                    clicked = True
-                    break
+                    // Next-Button Fallback
+                    var next = document.querySelector('[aria-label="next-page"]')
+                            || document.querySelector('.paginator-item.next')
+                            || document.querySelector('a.next');
+                    if (next) {{ next.click(); return "next"; }}
 
-            # Fallback: Next-Button
-            if not clicked:
-                for sel in (
-                    '[aria-label="next-page"]',
-                    'div.paginator-item.next',
-                    '.paginator-item.next',
-                    'a.next',
-                ):
-                    if _try_click(sel, 'Next-Button'):
-                        clicked = True
-                        break
-
-            if not clicked:
-                print(f"  Kein Paginator-Button klickbar – übersprungen")
+                    return "not-found";
+                }})()
+            ''')
+            print(f"  JS-Klick Ergebnis: {js_result}")
+            clicked = js_result != 'not-found'
 
             if clicked:
                 self._page.wait_for_load_state('networkidle', timeout=15000)
