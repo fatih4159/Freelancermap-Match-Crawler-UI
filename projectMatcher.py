@@ -75,6 +75,12 @@ class FreelancermapDatabase:
 
 
 class FreelancermapScraper:
+    _UA = (
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    )
+
     def __init__(self, db, username, password, max_pages=2, search_config=None):
         self.db = db
         self.base_url = "https://www.freelancermap.de"
@@ -86,6 +92,12 @@ class FreelancermapScraper:
         self._browser = None
         self._ctx = None
         self._page = None
+        # Interactive (non-headless) browser for manual fallback
+        self._ipw = None
+        self._ibrowser = None
+        self._ictx = None
+        self._ipage = None
+        self._interactive_mode = False  # once True, use interactive for all pages
 
     def _ensure_browser(self):
         if self._browser is None:
@@ -93,16 +105,49 @@ class FreelancermapScraper:
             self._pw = sync_playwright().start()
             self._browser = self._pw.chromium.launch(headless=True)
             self._ctx = self._browser.new_context(
-                locale='de-DE',
-                user_agent=(
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/124.0.0.0 Safari/537.36'
-                ),
-            )
+                locale='de-DE', user_agent=self._UA)
             self._page = self._ctx.new_page()
 
+    def _ensure_interactive_browser(self):
+        """Open or reuse a visible (non-headless) browser with the same session."""
+        if self._ipage and not self._ipage.is_closed():
+            return True
+        try:
+            cookies = self._ctx.cookies() if self._ctx else []
+        except Exception:
+            cookies = []
+        try:
+            from playwright.sync_api import sync_playwright
+            self._ipw = sync_playwright().start()
+            self._ibrowser = self._ipw.chromium.launch(
+                headless=False, args=['--window-size=1280,900'])
+            self._ictx = self._ibrowser.new_context(
+                locale='de-DE', user_agent=self._UA,
+                viewport={'width': 1280, 'height': 900})
+            self._ictx.add_cookies(cookies)
+            self._ipage = self._ictx.new_page()
+            return True
+        except Exception as e:
+            print(f"Interaktiver Browser konnte nicht geöffnet werden: {e}")
+            return False
+
+    def _close_interactive_browser(self):
+        for attr, obj in (
+            ('_ipage', None), ('_ictx', None),
+            ('_ibrowser', 'close'), ('_ipw', 'stop'),
+        ):
+            try:
+                o = getattr(self, attr)
+                if o:
+                    if obj:
+                        getattr(o, obj)()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        self._interactive_mode = False
+
     def close(self):
+        self._close_interactive_browser()
         try:
             if self._browser:
                 self._browser.close()
@@ -273,8 +318,12 @@ class FreelancermapScraper:
             # 2. Script-Tag: nur zuverlässig wenn currentPage übereinstimmt
             projects, current_page, _ = self._extract_from_script_json(soup)
             if current_page is not None and current_page != page_number:
-                print(f"Script-Tag zeigt Seite {current_page}, erwartet {page_number} – versuche Paginator-Klick …")
-                clicked_projects = self._click_and_extract(page_number)
+                print(f"Script-Tag zeigt Seite {current_page}, erwartet {page_number} – versuche Klick …")
+                clicked_projects = (
+                    self._interactive_get_projects(page_number)
+                    if self._interactive_mode
+                    else self._click_and_extract(page_number)
+                )
                 if clicked_projects:
                     return clicked_projects
             elif projects:
@@ -301,17 +350,37 @@ class FreelancermapScraper:
             self._page.remove_listener('response', _on_response)
             return []
 
+    def _js_click_next(self, pw_page, page_number):
+        """Tries to JS-click the next/direct paginator button. Returns 'direct', 'next' or 'not-found'."""
+        return pw_page.evaluate(f'''
+            (function() {{
+                var direct = document.querySelector('.paginator-item[data-page="{page_number}"]');
+                if (!direct) {{
+                    var links = document.querySelectorAll('a[href*="pagenr={page_number}"]');
+                    direct = links.length ? links[0] : null;
+                }}
+                if (direct) {{ direct.click(); return "direct"; }}
+                var next = document.querySelector('[aria-label="next-page"]')
+                        || document.querySelector('.paginator-item.next')
+                        || document.querySelector('a.next');
+                if (next) {{ next.click(); return "next"; }}
+                return "not-found";
+            }})()
+        ''')
+
+    def _collect_from_responses(self, responses, page_number):
+        """Parse raw response items into project dicts."""
+        projects = [self._parse_json_project(p, is_top=False) for p in responses]
+        return [p for p in projects if p]
+
     def _click_and_extract(self, page_number):
-        """Klickt den Paginator-Link für page_number (oder a.next als Fallback),
-        wartet auf Netzwerk-Idle und versucht die Extraktion erneut."""
-        new_page_specific = []
-        new_other = []
+        """Try JS click in headless browser; fall back to interactive browser."""
+        captured = []
 
         def _on_resp(response):
             if response.status != 200:
                 return
-            ct = response.headers.get('content-type', '')
-            if 'json' not in ct:
+            if 'json' not in response.headers.get('content-type', ''):
                 return
             try:
                 data = response.json()
@@ -328,74 +397,137 @@ class FreelancermapScraper:
                                 items = list(data[key])
                                 break
                 if items:
-                    if f'pagenr={page_number}' in response.url:
-                        new_page_specific.extend(items)
-                        print(f"  [Klick Seite {page_number}] {response.url[:100]} → {len(items)}")
-                    else:
-                        new_other.extend(items)
+                    captured.extend(items)
             except Exception:
                 pass
 
         try:
             self._page.on('response', _on_resp)
-            clicked = False
-
-            # Elemente sind im DOM aber nicht sichtbar – JS-Klick umgeht alle
-            # Playwright-Actionability-Checks direkt im Browser-Kontext.
-            js_result = self._page.evaluate(f'''
-                (function() {{
-                    // Direkter Seitenlink (data-page oder pagenr im href)
-                    var direct = document.querySelector(
-                        '.paginator-item[data-page="{page_number}"]'
-                    );
-                    if (!direct) {{
-                        var links = document.querySelectorAll('a[href*="pagenr={page_number}"]');
-                        direct = links.length ? links[0] : null;
-                    }}
-                    if (direct) {{ direct.click(); return "direct:{page_number}"; }}
-
-                    // Next-Button Fallback
-                    var next = document.querySelector('[aria-label="next-page"]')
-                            || document.querySelector('.paginator-item.next')
-                            || document.querySelector('a.next');
-                    if (next) {{ next.click(); return "next"; }}
-
-                    return "not-found";
-                }})()
-            ''')
-            print(f"  JS-Klick Ergebnis: {js_result}")
-            clicked = js_result != 'not-found'
-
-            if clicked:
+            result = self._js_click_next(self._page, page_number)
+            print(f"  JS-Klick (headless): {result}")
+            if result != 'not-found':
                 self._page.wait_for_load_state('networkidle', timeout=15000)
-
             self._page.remove_listener('response', _on_resp)
 
-            # Auswertung nach Klick
-            if new_page_specific:
-                print(f"Projekte via Paginator-Klick (seitenspezifisch): {len(new_page_specific)}")
-                projects = [self._parse_json_project(p, is_top=False) for p in new_page_specific]
-                return [p for p in projects if p]
-
-            if new_other:
-                print(f"Projekte via Paginator-Klick (sonstige API): {len(new_other)}")
-                projects = [self._parse_json_project(p, is_top=False) for p in new_other]
-                return [p for p in projects if p]
-
-            # Script-Tag nach Klick nochmal prüfen
-            content = self._page.content()
-            soup2 = BeautifulSoup(content, 'html.parser')
-            projects, cp, _ = self._extract_from_script_json(soup2)
-            if projects and cp == page_number:
-                print(f"Projekte via Script-Tag nach Klick (Seite {cp}): {len(projects)}")
-                return projects
-
-            return []
-
+            if captured:
+                projects = self._collect_from_responses(captured, page_number)
+                if projects:
+                    print(f"  Projekte via headless Klick: {len(projects)}")
+                    return projects
         except Exception as e:
-            print(f"Fehler beim Paginator-Klick: {e}")
+            print(f"  Headless-Klick Fehler: {e}")
             try:
                 self._page.remove_listener('response', _on_resp)
+            except Exception:
+                pass
+
+        # JS click failed or returned nothing → open interactive browser
+        print(f"  Öffne interaktiven Browser für Seite {page_number} …")
+        return self._interactive_get_projects(page_number)
+
+    def _interactive_get_projects(self, page_number):
+        """Navigate in non-headless browser, try auto-click, else wait for user."""
+        if not self._ensure_interactive_browser():
+            return []
+
+        url = self.get_page_url(page_number)
+        page = self._ipage
+        captured = []
+
+        def _on_resp(response):
+            if response.status != 200:
+                return
+            if 'json' not in response.headers.get('content-type', ''):
+                return
+            try:
+                data = response.json()
+                items = []
+                if isinstance(data, list) and data and isinstance(data[0], dict) and 'title' in data[0]:
+                    items = list(data)
+                elif isinstance(data, dict):
+                    for key in ('initialTopResults', 'initialResults'):
+                        if key in data and isinstance(data[key], list) and data[key]:
+                            items.extend(data[key])
+                    if not items:
+                        for key in ('projects', 'hits', 'items', 'results', 'data'):
+                            if key in data and isinstance(data[key], list) and data[key]:
+                                items = list(data[key])
+                                break
+                if items:
+                    captured.extend(items)
+            except Exception:
+                pass
+
+        try:
+            page.on('response', _on_resp)
+            page.goto(url, wait_until='networkidle', timeout=30000)
+            baseline = len(captured)  # responses from initial page load
+
+            # Try auto-click in the visible browser
+            result = self._js_click_next(page, page_number)
+            print(f"  JS-Klick (interaktiv): {result}")
+
+            if result != 'not-found':
+                # Auto-click worked – wait for data
+                self._interactive_mode = True
+                page.wait_for_load_state('networkidle', timeout=10000)
+            else:
+                # Show overlay and let user click manually
+                page.evaluate(f'''
+                    (function() {{
+                        var old = document.getElementById("__si");
+                        if (old) old.remove();
+                        var d = document.createElement("div");
+                        d.id = "__si";
+                        d.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;"
+                            + "background:rgba(20,90,200,0.95);color:#fff;padding:14px 20px;"
+                            + "font:bold 15px sans-serif;text-align:center;";
+                        d.textContent = "Scraper wartet – Klicke den WEITER-Button für Seite {page_number}."
+                            + " Fenster schließen = Seite überspringen.";
+                        document.body.prepend(d);
+                        document.querySelectorAll(
+                            "[aria-label=\\"next-page\\"], .paginator-item.next"
+                        ).forEach(function(el) {{
+                            el.style.cssText += ";outline:4px solid red !important;"
+                                + "background:#ffcc00 !important;opacity:1 !important;"
+                                + "visibility:visible !important;";
+                        }});
+                    }})()
+                ''')
+                print(f"  Warte auf Benutzer-Klick für Seite {page_number} (Fenster schließen = überspringen) …")
+
+                # Wait up to 2 minutes for new API response or window close
+                import time
+                deadline = time.time() + 120
+                while not page.is_closed() and time.time() < deadline:
+                    if len(captured) > baseline:
+                        time.sleep(1.0)  # let remaining responses arrive
+                        break
+                    time.sleep(0.3)
+
+                if page.is_closed():
+                    print(f"  Browser geschlossen – Seite {page_number} übersprungen")
+                    self._close_interactive_browser()
+                    return []
+
+                if len(captured) <= baseline:
+                    print(f"  Timeout – Seite {page_number} übersprungen")
+                    return []
+
+                # User clicked → enable interactive mode for remaining pages
+                self._interactive_mode = True
+                print(f"  Benutzer hat geklickt – interaktiver Modus aktiv für alle weiteren Seiten")
+
+            page.remove_listener('response', _on_resp)
+            new_items = captured[baseline:]
+            projects = self._collect_from_responses(new_items, page_number)
+            print(f"  Interaktiver Browser: {len(projects)} Projekte (Seite {page_number})")
+            return projects
+
+        except Exception as e:
+            print(f"  Fehler im interaktiven Browser: {e}")
+            try:
+                page.remove_listener('response', _on_resp)
             except Exception:
                 pass
             return []
