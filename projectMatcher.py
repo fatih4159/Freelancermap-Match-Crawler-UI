@@ -270,14 +270,16 @@ class FreelancermapScraper:
                 projects = [self._parse_json_project(p, is_top=False) for p in page_specific]
                 return [p for p in projects if p]
 
-            # 2. Script-Tag: nur zuverlässig für Seite 1 (SSR)
+            # 2. Script-Tag: nur zuverlässig wenn currentPage übereinstimmt
             projects, current_page, _ = self._extract_from_script_json(soup)
-            if current_page is not None:
-                if current_page == page_number:
-                    print(f"Projekte via Script-Tag (SSR Seite {current_page}): {len(projects)}")
-                    return projects
-                else:
-                    print(f"Script-Tag zeigt Seite {current_page}, erwartet {page_number} – übersprungen")
+            if current_page is not None and current_page != page_number:
+                print(f"Script-Tag zeigt Seite {current_page}, erwartet {page_number} – versuche Paginator-Klick …")
+                clicked_projects = self._click_and_extract(page_number)
+                if clicked_projects:
+                    return clicked_projects
+            elif projects:
+                print(f"Projekte via Script-Tag (SSR Seite {current_page}): {len(projects)}")
+                return projects
 
             # 3. Sonstige API-Responses als Fallback
             if other_captured:
@@ -297,6 +299,99 @@ class FreelancermapScraper:
         except Exception as e:
             print(f"Fehler beim Laden der Seite {page_number}: {str(e)}")
             self._page.remove_listener('response', _on_response)
+            return []
+
+    def _click_and_extract(self, page_number):
+        """Klickt den Paginator-Link für page_number (oder a.next als Fallback),
+        wartet auf Netzwerk-Idle und versucht die Extraktion erneut."""
+        new_page_specific = []
+        new_other = []
+
+        def _on_resp(response):
+            if response.status != 200:
+                return
+            ct = response.headers.get('content-type', '')
+            if 'json' not in ct:
+                return
+            try:
+                data = response.json()
+                items = []
+                if isinstance(data, list) and data and isinstance(data[0], dict) and 'title' in data[0]:
+                    items = list(data)
+                elif isinstance(data, dict):
+                    for key in ('initialTopResults', 'initialResults'):
+                        if key in data and isinstance(data[key], list) and data[key]:
+                            items.extend(data[key])
+                    if not items:
+                        for key in ('projects', 'hits', 'items', 'results', 'data'):
+                            if key in data and isinstance(data[key], list) and data[key]:
+                                items = list(data[key])
+                                break
+                if items:
+                    if f'pagenr={page_number}' in response.url:
+                        new_page_specific.extend(items)
+                        print(f"  [Klick Seite {page_number}] {response.url[:100]} → {len(items)}")
+                    else:
+                        new_other.extend(items)
+            except Exception:
+                pass
+
+        try:
+            self._page.on('response', _on_resp)
+            clicked = False
+
+            # Bevorzuge: direkter Paginator-Link für gesuchte Seite
+            direct_sel = f'a[href*="pagenr={page_number}"]'
+            try:
+                self._page.wait_for_selector(direct_sel, timeout=2000)
+                self._page.click(direct_sel)
+                print(f"  Paginator-Link pagenr={page_number} geklickt")
+                clicked = True
+            except Exception:
+                pass
+
+            # Fallback: a.next klicken
+            if not clicked:
+                try:
+                    self._page.wait_for_selector('a.next', timeout=2000)
+                    self._page.click('a.next')
+                    print(f"  a.next geklickt")
+                    clicked = True
+                except Exception:
+                    print(f"  Kein Paginator-Link gefunden – übersprungen")
+
+            if clicked:
+                self._page.wait_for_load_state('networkidle', timeout=15000)
+
+            self._page.remove_listener('response', _on_resp)
+
+            # Auswertung nach Klick
+            if new_page_specific:
+                print(f"Projekte via Paginator-Klick (seitenspezifisch): {len(new_page_specific)}")
+                projects = [self._parse_json_project(p, is_top=False) for p in new_page_specific]
+                return [p for p in projects if p]
+
+            if new_other:
+                print(f"Projekte via Paginator-Klick (sonstige API): {len(new_other)}")
+                projects = [self._parse_json_project(p, is_top=False) for p in new_other]
+                return [p for p in projects if p]
+
+            # Script-Tag nach Klick nochmal prüfen
+            content = self._page.content()
+            soup2 = BeautifulSoup(content, 'html.parser')
+            projects, cp, _ = self._extract_from_script_json(soup2)
+            if projects and cp == page_number:
+                print(f"Projekte via Script-Tag nach Klick (Seite {cp}): {len(projects)}")
+                return projects
+
+            return []
+
+        except Exception as e:
+            print(f"Fehler beim Paginator-Klick: {e}")
+            try:
+                self._page.remove_listener('response', _on_resp)
+            except Exception:
+                pass
             return []
 
     # ------------------------------------------------------------------
