@@ -340,25 +340,39 @@ class FreelancermapScraper:
             self._page.on('response', _on_resp)
             clicked = False
 
-            # Bevorzuge: direkter Paginator-Link für gesuchte Seite
-            direct_sel = f'a[href*="pagenr={page_number}"]'
-            try:
-                self._page.wait_for_selector(direct_sel, timeout=2000)
-                self._page.click(direct_sel)
-                print(f"  Paginator-Link pagenr={page_number} geklickt")
-                clicked = True
-            except Exception:
-                pass
-
-            # Fallback: a.next klicken
-            if not clicked:
+            # Bevorzuge: direkter Paginator-Link für gesuchte Seite (div oder a)
+            direct_sels = [
+                f'.paginator-item[data-page="{page_number}"]',
+                f'a[href*="pagenr={page_number}"]',
+            ]
+            for sel in direct_sels:
                 try:
-                    self._page.wait_for_selector('a.next', timeout=2000)
-                    self._page.click('a.next')
-                    print(f"  a.next geklickt")
+                    self._page.wait_for_selector(sel, timeout=1500)
+                    self._page.click(sel)
+                    print(f"  Paginator-Link pagenr={page_number} geklickt ({sel})")
                     clicked = True
+                    break
                 except Exception:
-                    print(f"  Kein Paginator-Link gefunden – übersprungen")
+                    pass
+
+            # Fallback: Next-Button klicken (div.paginator-item.next)
+            if not clicked:
+                next_sels = [
+                    '[aria-label="next-page"]',
+                    'div.paginator-item.next',
+                    'a.next',
+                ]
+                for sel in next_sels:
+                    try:
+                        self._page.wait_for_selector(sel, timeout=1500)
+                        self._page.click(sel)
+                        print(f"  Next-Button geklickt ({sel})")
+                        clicked = True
+                        break
+                    except Exception:
+                        pass
+                if not clicked:
+                    print(f"  Kein Paginator-Button gefunden – übersprungen")
 
             if clicked:
                 self._page.wait_for_load_state('networkidle', timeout=15000)
