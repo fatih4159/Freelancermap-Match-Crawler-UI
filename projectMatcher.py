@@ -113,10 +113,6 @@ class FreelancermapScraper:
         if self._ipage and not self._ipage.is_closed():
             return True
         try:
-            cookies = self._ctx.cookies() if self._ctx else []
-        except Exception:
-            cookies = []
-        try:
             # Reuse the existing playwright instance – no second sync_playwright() needed
             self._ensure_browser()
             self._ibrowser = self._pw.chromium.launch(
@@ -124,8 +120,13 @@ class FreelancermapScraper:
             self._ictx = self._ibrowser.new_context(
                 locale='de-DE', user_agent=self._UA,
                 viewport={'width': 1280, 'height': 900})
-            self._ictx.add_cookies(cookies)
             self._ipage = self._ictx.new_page()
+            print("  Interaktiver Browser: führe Login durch …")
+            ok = self._do_login(self._ipage)
+            if ok:
+                print("  Interaktiver Browser: Login erfolgreich")
+            else:
+                print("  Interaktiver Browser: Login fehlgeschlagen")
             return True
         except Exception as e:
             print(f"Interaktiver Browser konnte nicht geöffnet werden: {e}")
@@ -165,34 +166,33 @@ class FreelancermapScraper:
     def __del__(self):
         self.close()
 
+    def _do_login(self, page):
+        """Perform login on any Playwright page object. Returns True on success."""
+        try:
+            page.goto(f"{self.base_url}/login", wait_until='networkidle', timeout=30000)
+            page.fill('input[name="login"]', self.username)
+            page.fill('input[name="password"]', self.password)
+            with page.expect_navigation(wait_until='domcontentloaded', timeout=15000):
+                page.press('input[name="password"]', 'Enter')
+            time.sleep(1)
+            page.goto(f"{self.base_url}/mein_account.html", wait_until='domcontentloaded', timeout=15000)
+            content = page.content()
+            return any(x in content for x in ['Mein Konto', 'Profil', 'Logout', 'Abmelden'])
+        except Exception as e:
+            print(f"Login-Fehler: {e}")
+            return False
+
     def login(self):
         try:
             print("Starte Login-Prozess...")
             self._ensure_browser()
-
             print("Lade Login-Seite...")
-            self._page.goto(f"{self.base_url}/login", wait_until='networkidle', timeout=30000)
-
-            print("Führe Login durch...")
-            self._page.fill('input[name="login"]', self.username)
-            self._page.fill('input[name="password"]', self.password)
-
-            with self._page.expect_navigation(wait_until='domcontentloaded', timeout=15000):
-                self._page.press('input[name="password"]', 'Enter')
-
-            print(f"Response URL: {self._page.url}")
-
-            time.sleep(1)
-            self._page.goto(f"{self.base_url}/mein_account.html", wait_until='domcontentloaded', timeout=15000)
-
-            content = self._page.content()
-            if any(x in content for x in ['Mein Konto', 'Profil', 'Logout', 'Abmelden']):
+            ok = self._do_login(self._page)
+            if ok:
                 print("Login erfolgreich!")
-                return True
-
-            print("Login fehlgeschlagen: Keine Login-Indikatoren gefunden")
-            return False
-
+            else:
+                print("Login fehlgeschlagen: Keine Login-Indikatoren gefunden")
+            return ok
         except Exception as e:
             print(f"Fehler beim Login: {str(e)}")
             return False
@@ -461,6 +461,30 @@ class FreelancermapScraper:
             page.on('response', _on_resp)
             page.goto(url, wait_until='networkidle', timeout=30000)
             baseline = len(captured)  # responses from initial page load
+
+            # Dismiss any registration/login modal that might block the paginator
+            try:
+                page.keyboard.press('Escape')
+                page.evaluate('''
+                    (function() {
+                        var selectors = [
+                            '[data-dismiss="modal"]', '.modal .close', '.modal-close',
+                            'button.close', '[aria-label="Close"]', '[aria-label="Schließen"]',
+                            '.overlay-close', '.popup-close', '.js-close-modal'
+                        ];
+                        selectors.forEach(function(sel) {
+                            document.querySelectorAll(sel).forEach(function(el) { el.click(); });
+                        });
+                        // Also remove any full-screen overlays/backdrops
+                        document.querySelectorAll('.modal-backdrop,.modal.show,.overlay').forEach(
+                            function(el) { el.remove(); }
+                        );
+                        document.body.classList.remove('modal-open');
+                    })()
+                ''')
+                time.sleep(0.5)
+            except Exception:
+                pass
 
             # Try auto-click in the visible browser
             result = self._js_click_next(page, page_number)
