@@ -205,8 +205,27 @@ class FreelancermapScraper:
         print(f"\nAbrufen von Seite {page_number}")
         print(f"URL: {url}")
 
-        captured_json = []
-        captured_urls = []
+        # Separate buckets: responses whose URL contains pagenr=N (page-specific)
+        # vs. everything else (recommendations, featured, etc.)
+        page_specific = []
+        other_captured = []
+
+        def _extract_items(data):
+            if isinstance(data, list) and data and isinstance(data[0], dict) and 'title' in data[0]:
+                return list(data)
+            if isinstance(data, dict):
+                for key in ('initialTopResults', 'initialResults'):
+                    pass  # handled below to avoid break
+                items = []
+                for key in ('initialTopResults', 'initialResults'):
+                    if key in data and isinstance(data[key], list) and data[key]:
+                        items.extend(data[key])
+                if items:
+                    return items
+                for key in ('projects', 'hits', 'items', 'results', 'data'):
+                    if key in data and isinstance(data[key], list) and data[key]:
+                        return list(data[key])
+            return []
 
         def _on_response(response):
             if response.status != 200:
@@ -216,23 +235,17 @@ class FreelancermapScraper:
                 return
             try:
                 data = response.json()
-                before = len(captured_json)
-                if isinstance(data, list) and data and isinstance(data[0], dict) and 'title' in data[0]:
-                    captured_json.extend(data)
-                elif isinstance(data, dict):
-                    got = False
-                    for key in ('initialTopResults', 'initialResults'):
-                        if key in data and isinstance(data[key], list) and data[key]:
-                            captured_json.extend(data[key])
-                            got = True
-                    if not got:
-                        for key in ('projects', 'hits', 'items', 'results', 'data'):
-                            if key in data and isinstance(data[key], list) and data[key]:
-                                captured_json.extend(data[key])
-                                break
-                added = len(captured_json) - before
-                if added:
-                    captured_urls.append(f"{response.url[:120]} → {added} Projekte")
+                items = _extract_items(data)
+                if not items:
+                    return
+                rurl = response.url
+                label = f"{rurl[:120]} → {len(items)} Projekte"
+                if f'pagenr={page_number}' in rurl:
+                    page_specific.extend(items)
+                    print(f"  [Seite {page_number}] API: {label}")
+                else:
+                    other_captured.extend(items)
+                    print(f"  [Sonstige]    API: {label}")
             except Exception:
                 pass
 
@@ -251,29 +264,31 @@ class FreelancermapScraper:
 
             soup = BeautifulSoup(content, 'html.parser')
 
-            # Primary: server-rendered script tag (page-specific SSR data)
+            # 1. Beste Quelle: API-Response mit passender pagenr im URL
+            if page_specific:
+                print(f"Projekte via Seiten-spezifischer API: {len(page_specific)}")
+                projects = [self._parse_json_project(p, is_top=False) for p in page_specific]
+                return [p for p in projects if p]
+
+            # 2. Script-Tag: nur zuverlässig für Seite 1 (SSR)
             projects, current_page, _ = self._extract_from_script_json(soup)
             if current_page is not None:
                 if current_page == page_number:
-                    print(f"Seite {current_page} korrekt geladen ✓")
+                    print(f"Projekte via Script-Tag (SSR Seite {current_page}): {len(projects)}")
+                    return projects
                 else:
-                    print(f"WARNUNG: Seite {current_page} geladen, {page_number} erwartet!")
-            if projects:
-                print(f"Projekte via Script-Tag (SSR): {len(projects)}")
-                return projects
+                    print(f"Script-Tag zeigt Seite {current_page}, erwartet {page_number} – übersprungen")
 
-            # Secondary: JSON captured from network responses
-            if captured_json:
-                for u in captured_urls:
-                    print(f"  API-Response: {u}")
-                print(f"Projekte via API-Antwort: {len(captured_json)}")
-                projects = [self._parse_json_project(p, is_top=False) for p in captured_json]
+            # 3. Sonstige API-Responses als Fallback
+            if other_captured:
+                print(f"Projekte via sonstige API-Antwort: {len(other_captured)}")
+                projects = [self._parse_json_project(p, is_top=False) for p in other_captured]
                 return [p for p in projects if p]
 
-            # Tertiary: rendered HTML elements
+            # 4. React-gerendertes HTML (DOM nach Hydration)
             projects = self._extract_from_html(soup)
             if projects:
-                print(f"Projekte via HTML: {len(projects)}")
+                print(f"Projekte via gerendertem HTML: {len(projects)}")
                 return projects
 
             print("Keine Projekte auf dieser Seite gefunden!")
