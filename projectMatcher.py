@@ -340,46 +340,41 @@ class FreelancermapScraper:
             self._page.on('response', _on_resp)
             clicked = False
 
-            # Warte auf Paginator-Container bevor wir Buttons suchen
-            try:
-                self._page.wait_for_selector('.paginator-item', timeout=5000)
-            except Exception:
-                print(f"  Paginator nicht gefunden (noch nicht gerendert?)")
+            # Elemente existieren im DOM aber sind nicht unbedingt sichtbar.
+            # Daher: state='attached' + force=True beim Klick.
+            def _try_click(sel, label):
+                try:
+                    self._page.wait_for_selector(sel, state='attached', timeout=3000)
+                    self._page.locator(sel).first.click(force=True)
+                    print(f"  Geklickt: {label} ({sel})")
+                    return True
+                except Exception as e:
+                    print(f"  Nicht gefunden: {sel} – {str(e)[:80]}")
+                    return False
 
-            # Bevorzuge: direkter Paginator-Link für gesuchte Seite (div oder a)
-            direct_sels = [
+            # Bevorzuge: direkter Paginator-Link für gesuchte Seite
+            for sel in (
                 f'.paginator-item[data-page="{page_number}"]',
                 f'a[href*="pagenr={page_number}"]',
-            ]
-            for sel in direct_sels:
-                try:
-                    self._page.wait_for_selector(sel, timeout=2000)
-                    self._page.click(sel)
-                    print(f"  Paginator-Link pagenr={page_number} geklickt ({sel})")
+            ):
+                if _try_click(sel, f'Seite {page_number}'):
                     clicked = True
                     break
-                except Exception as e:
-                    print(f"  Selektor nicht gefunden: {sel} ({e})")
 
-            # Fallback: Next-Button klicken
+            # Fallback: Next-Button
             if not clicked:
-                next_sels = [
+                for sel in (
                     '[aria-label="next-page"]',
                     'div.paginator-item.next',
                     '.paginator-item.next',
                     'a.next',
-                ]
-                for sel in next_sels:
-                    try:
-                        self._page.wait_for_selector(sel, timeout=2000)
-                        self._page.click(sel)
-                        print(f"  Next-Button geklickt ({sel})")
+                ):
+                    if _try_click(sel, 'Next-Button'):
                         clicked = True
                         break
-                    except Exception as e:
-                        print(f"  Next-Selektor nicht gefunden: {sel} ({e})")
-                if not clicked:
-                    print(f"  Kein Paginator-Button gefunden – übersprungen")
+
+            if not clicked:
+                print(f"  Kein Paginator-Button klickbar – übersprungen")
 
             if clicked:
                 self._page.wait_for_load_state('networkidle', timeout=15000)
