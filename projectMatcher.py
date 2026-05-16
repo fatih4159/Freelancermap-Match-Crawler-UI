@@ -109,7 +109,7 @@ class FreelancermapScraper:
             self._page = self._ctx.new_page()
 
     def _ensure_interactive_browser(self):
-        """Open or reuse a visible (non-headless) browser with the same session."""
+        """Open or reuse a visible (non-headless) browser, sharing the existing pw instance."""
         if self._ipage and not self._ipage.is_closed():
             return True
         try:
@@ -117,9 +117,9 @@ class FreelancermapScraper:
         except Exception:
             cookies = []
         try:
-            from playwright.sync_api import sync_playwright
-            self._ipw = sync_playwright().start()
-            self._ibrowser = self._ipw.chromium.launch(
+            # Reuse the existing playwright instance – no second sync_playwright() needed
+            self._ensure_browser()
+            self._ibrowser = self._pw.chromium.launch(
                 headless=False, args=['--window-size=1280,900'])
             self._ictx = self._ibrowser.new_context(
                 locale='de-DE', user_agent=self._UA,
@@ -134,13 +134,12 @@ class FreelancermapScraper:
     def _close_interactive_browser(self):
         for attr, obj in (
             ('_ipage', None), ('_ictx', None),
-            ('_ibrowser', 'close'), ('_ipw', 'stop'),
+            ('_ibrowser', 'close'),
         ):
             try:
                 o = getattr(self, attr)
-                if o:
-                    if obj:
-                        getattr(o, obj)()
+                if o and obj:
+                    getattr(o, obj)()
             except Exception:
                 pass
             setattr(self, attr, None)
