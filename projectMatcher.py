@@ -340,6 +340,12 @@ class FreelancermapScraper:
             self._page.on('response', _on_resp)
             clicked = False
 
+            # Warte auf Paginator-Container bevor wir Buttons suchen
+            try:
+                self._page.wait_for_selector('.paginator-item', timeout=5000)
+            except Exception:
+                print(f"  Paginator nicht gefunden (noch nicht gerendert?)")
+
             # Bevorzuge: direkter Paginator-Link für gesuchte Seite (div oder a)
             direct_sels = [
                 f'.paginator-item[data-page="{page_number}"]',
@@ -347,30 +353,31 @@ class FreelancermapScraper:
             ]
             for sel in direct_sels:
                 try:
-                    self._page.wait_for_selector(sel, timeout=1500)
+                    self._page.wait_for_selector(sel, timeout=2000)
                     self._page.click(sel)
                     print(f"  Paginator-Link pagenr={page_number} geklickt ({sel})")
                     clicked = True
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"  Selektor nicht gefunden: {sel} ({e})")
 
-            # Fallback: Next-Button klicken (div.paginator-item.next)
+            # Fallback: Next-Button klicken
             if not clicked:
                 next_sels = [
                     '[aria-label="next-page"]',
                     'div.paginator-item.next',
+                    '.paginator-item.next',
                     'a.next',
                 ]
                 for sel in next_sels:
                     try:
-                        self._page.wait_for_selector(sel, timeout=1500)
+                        self._page.wait_for_selector(sel, timeout=2000)
                         self._page.click(sel)
                         print(f"  Next-Button geklickt ({sel})")
                         clicked = True
                         break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"  Next-Selektor nicht gefunden: {sel} ({e})")
                 if not clicked:
                     print(f"  Kein Paginator-Button gefunden – übersprungen")
 
