@@ -206,6 +206,7 @@ class FreelancermapScraper:
         print(f"URL: {url}")
 
         captured_json = []
+        captured_urls = []
 
         def _on_response(response):
             if response.status != 200:
@@ -215,10 +216,10 @@ class FreelancermapScraper:
                 return
             try:
                 data = response.json()
+                before = len(captured_json)
                 if isinstance(data, list) and data and isinstance(data[0], dict) and 'title' in data[0]:
                     captured_json.extend(data)
                 elif isinstance(data, dict):
-                    # Collect top results AND regular results (no break between them)
                     got = False
                     for key in ('initialTopResults', 'initialResults'):
                         if key in data and isinstance(data[key], list) and data[key]:
@@ -229,6 +230,9 @@ class FreelancermapScraper:
                             if key in data and isinstance(data[key], list) and data[key]:
                                 captured_json.extend(data[key])
                                 break
+                added = len(captured_json) - before
+                if added:
+                    captured_urls.append(f"{response.url[:120]} → {added} Projekte")
             except Exception:
                 pass
 
@@ -236,8 +240,6 @@ class FreelancermapScraper:
             self._page.on('response', _on_response)
             self._page.goto(url, wait_until='networkidle', timeout=30000)
             self._page.remove_listener('response', _on_response)
-
-            print(f"Status Code: 200 (Playwright)")
 
             content = self._page.content()
 
@@ -247,19 +249,26 @@ class FreelancermapScraper:
                     return self.get_page(page_number)
                 return []
 
-            # Primary: JSON captured from network responses (React API calls)
+            soup = BeautifulSoup(content, 'html.parser')
+
+            # Primary: server-rendered script tag (page-specific SSR data)
+            projects, current_page, _ = self._extract_from_script_json(soup)
+            if current_page is not None:
+                if current_page == page_number:
+                    print(f"Seite {current_page} korrekt geladen ✓")
+                else:
+                    print(f"WARNUNG: Seite {current_page} geladen, {page_number} erwartet!")
+            if projects:
+                print(f"Projekte via Script-Tag (SSR): {len(projects)}")
+                return projects
+
+            # Secondary: JSON captured from network responses
             if captured_json:
+                for u in captured_urls:
+                    print(f"  API-Response: {u}")
                 print(f"Projekte via API-Antwort: {len(captured_json)}")
                 projects = [self._parse_json_project(p, is_top=False) for p in captured_json]
                 return [p for p in projects if p]
-
-            soup = BeautifulSoup(content, 'html.parser')
-
-            # Secondary: JSON embedded in script tag (top_projects etc.)
-            projects = self._extract_from_script_json(soup)
-            if projects:
-                print(f"Projekte via eingebettetem JSON: {len(projects)}")
-                return projects
 
             # Tertiary: rendered HTML elements
             projects = self._extract_from_html(soup)
@@ -279,22 +288,35 @@ class FreelancermapScraper:
     # Extraction helpers
     # ------------------------------------------------------------------
 
-    def _extract_from_script_json(self, soup):
-        """Parse projects embedded in the React-on-Rails JSON script tag."""
+    def _parse_script_tag(self, soup):
+        """Return the raw JSON dict from the ProjectSearch script tag, or None."""
         script = soup.find(
             'script',
             class_='js-react-on-rails-component',
             attrs={'data-component-name': 'ProjectSearch'},
         )
         if not script or not script.string:
-            return []
+            return None
         try:
-            data = json.loads(script.string)
+            return json.loads(script.string)
         except json.JSONDecodeError:
-            return []
+            return None
+
+    def _extract_from_script_json(self, soup):
+        """Parse projects from the React-on-Rails JSON script tag.
+        Returns (projects, current_page, total_pages)."""
+        data = self._parse_script_tag(soup)
+        if not data:
+            return [], None, None
+
+        current_page = data.get('currentPage')
+
+        # Total pages: highest pagenr= in the pagination HTML
+        pagination_html = data.get('initialPagination', '')
+        page_nums = [int(n) for n in re.findall(r'pagenr=(\d+)', pagination_html)]
+        total_pages = max(page_nums) if page_nums else None
 
         projects = []
-        # Current API format: initialTopResults + initialResults
         for p in data.get('initialTopResults', []):
             parsed = self._parse_json_project(p, is_top=True)
             if parsed:
@@ -304,18 +326,31 @@ class FreelancermapScraper:
             if parsed:
                 projects.append(parsed)
 
-        if projects:
-            return projects
+        if not projects:
+            for key in ('projects', 'top_projects', 'hits', 'items'):
+                items = data.get(key, [])
+                if items:
+                    for p in items:
+                        parsed = self._parse_json_project(p, is_top=(key == 'top_projects'))
+                        if parsed:
+                            projects.append(parsed)
 
-        # Legacy fallback keys
-        for key in ('projects', 'top_projects', 'hits', 'items'):
-            items = data.get(key, [])
-            if items:
-                for p in items:
-                    parsed = self._parse_json_project(p, is_top=(key == 'top_projects'))
-                    if parsed:
-                        projects.append(parsed)
-        return projects
+        return projects, current_page, total_pages
+
+    def get_total_pages(self):
+        """Load page 1 and return the total page count detected from pagination."""
+        self._ensure_browser()
+        url = self.get_page_url(1)
+        print(f"Ermittle Gesamtseitenanzahl …")
+        self._page.goto(url, wait_until='networkidle', timeout=30000)
+        content = self._page.content()
+        soup = BeautifulSoup(content, 'html.parser')
+        _, _, total_pages = self._extract_from_script_json(soup)
+        if total_pages:
+            print(f"Gesamtseitenanzahl erkannt: {total_pages}")
+        else:
+            print("Konnte Gesamtseitenanzahl nicht ermitteln.")
+        return total_pages
 
     def _parse_json_project(self, p, is_top=False):
         """Convert a raw JSON project object into the internal dict format."""

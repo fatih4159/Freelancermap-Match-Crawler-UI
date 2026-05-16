@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     'username': '',
     'password': '',
     'max_pages': 10,
+    'all_pages': False,
     'min_score': 35,
     'matching_enabled': True,
     'skills': 'Python, JavaScript, React, Vue, MySQL, HTML, CSS, PHP, GCP, AWS, Cloud, AI, Frontend, Vue.js, JS',
@@ -230,6 +231,7 @@ class ScraperWorker(QThread):
                 'excluded_keywords':  [s.strip() for s in self.config['excluded_keywords'].split(',') if s.strip()],
             }
             max_pages = max(1, int(self.config['max_pages']))
+            all_pages_mode = self.config.get('all_pages', False)
             min_score = int(self.config['min_score'])
 
             direct_url = self.config.get('direct_url', '').strip()
@@ -244,7 +246,10 @@ class ScraperWorker(QThread):
                 'direct_url':     direct_url,
             }
 
-            self.log.emit(f'Starte Scraping  |  Seiten: {max_pages}  |  Min-Score: {min_score}', 'info')
+            if all_pages_mode:
+                self.log.emit('Modus: Alle Seiten – ermittle Gesamtseitenanzahl …', 'info')
+            else:
+                self.log.emit(f'Starte Scraping  |  Seiten: {max_pages}  |  Min-Score: {min_score}', 'info')
             self.log.emit(f'Skills: {", ".join(profile["skills"][:8])} …', 'info')
             if direct_url:
                 self.log.emit(f'Modus: URL-Import  |  pagenr wird pro Seite angepasst', 'info')
@@ -266,6 +271,17 @@ class ScraperWorker(QThread):
                 self.log.emit('Login fehlgeschlagen – Zugangsdaten prüfen.', 'error')
                 self.finished.emit(0)
                 return
+
+            if all_pages_mode:
+                detected = scraper.get_total_pages()
+                if detected:
+                    max_pages = detected
+                    self.log.emit(f'Gesamtseitenanzahl erkannt: {max_pages} – starte Scraping …', 'success')
+                else:
+                    self.log.emit('Seitenanzahl nicht erkennbar – nutze Max. Seiten aus Einstellungen.', 'warning')
+                    self.log.emit(f'Starte Scraping  |  Seiten: {max_pages}  |  Min-Score: {min_score}', 'info')
+            else:
+                self.log.emit(f'Starte Scraping  |  Seiten: {max_pages}  |  Min-Score: {min_score}', 'info')
 
             scraped = 0
             new_inserts = 0
@@ -387,9 +403,21 @@ class MainWindow(QMainWindow):
         fl2 = QFormLayout(sc)
         fl2.setSpacing(8)
         self._max_pages = QSpinBox()
-        self._max_pages.setRange(1, 200)
+        self._max_pages.setRange(1, 500)
         self._max_pages.setValue(int(self.config['max_pages']))
         self._max_pages.setFixedWidth(80)
+        self._all_pages = QCheckBox('Alle Seiten (automatisch)')
+        self._all_pages.setChecked(self.config.get('all_pages', False))
+        self._all_pages.setToolTip(
+            'Erkennt die Gesamtseitenanzahl automatisch aus der Seite und scrapet alle.')
+        self._all_pages.toggled.connect(self._max_pages.setDisabled)
+        self._max_pages.setDisabled(self.config.get('all_pages', False))
+        pages_widget = QWidget()
+        pages_h = QHBoxLayout(pages_widget)
+        pages_h.setContentsMargins(0, 0, 0, 0)
+        pages_h.addWidget(self._max_pages)
+        pages_h.addWidget(self._all_pages)
+        pages_h.addStretch()
         self._min_score = QSpinBox()
         self._min_score.setRange(0, 100)
         self._min_score.setValue(int(self.config['min_score']))
@@ -401,7 +429,7 @@ class MainWindow(QMainWindow):
             '(nützlich für reine Extraktion aller Ergebnisse).')
         self._matching_enabled.toggled.connect(self._min_score.setEnabled)
         self._min_score.setEnabled(self.config.get('matching_enabled', True))
-        fl2.addRow('Max. Seiten:', self._max_pages)
+        fl2.addRow('Max. Seiten:', pages_widget)
         fl2.addRow('Min. Score (0–100):', self._min_score)
         fl2.addRow('Matching:', self._matching_enabled)
         root.addWidget(sc)
@@ -547,6 +575,7 @@ class MainWindow(QMainWindow):
             'username':           self._username.text(),
             'password':           self._password.text(),
             'max_pages':          self._max_pages.value(),
+            'all_pages':          self._all_pages.isChecked(),
             'min_score':          self._min_score.value(),
             'matching_enabled':   self._matching_enabled.isChecked(),
             'skills':             self._skills.text(),
