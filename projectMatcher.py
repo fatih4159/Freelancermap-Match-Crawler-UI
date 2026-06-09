@@ -1040,14 +1040,20 @@ class FreelancermapScraper:
                 for project in projects:
                     link = project['link']
 
-                    # Only scrape detail page for newly inserted rows
                     cur = self.db.conn.execute(
-                        "SELECT id FROM projects WHERE link = ?", (link,)
+                        """SELECT id, contact_first_name, contact_last_name,
+                                  contact_email, contact_phone, company_website
+                           FROM projects WHERE link = ?""", (link,)
                     )
                     existing = cur.fetchone()
 
-                    if existing:
-                        # Project already in DB – skip detail scraping
+                    # Skip detail scraping only if the row exists AND already has
+                    # at least one contact field filled in.
+                    has_contact = existing and any([
+                        existing[1], existing[2], existing[3],
+                        existing[4], existing[5],
+                    ])
+                    if has_contact:
                         continue
 
                     # Scrape contact data from the detail page (+ company profile)
@@ -1061,28 +1067,45 @@ class FreelancermapScraper:
                     contact_phone      = cphone or project.get('kontakt_telefon')
                     company_website    = cwebsite
 
-                    self.db.conn.execute("""
-                        INSERT OR IGNORE INTO projects
-                        (title, link, company, description, keywords,
-                        created_date, is_top_project, is_endcustomer,
-                        contact_first_name, contact_last_name,
-                        contact_email, contact_phone, company_website)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        project['titel'],
-                        link,
-                        project['firma'],
-                        project['beschreibung'],
-                        project['keywords'],
-                        project['eintragungsdatum'],
-                        project['ist_top_projekt'],
-                        project['ist_endkundenprojekt'],
-                        contact_first_name,
-                        contact_last_name,
-                        contact_email,
-                        contact_phone,
-                        company_website,
-                    ))
+                    if existing:
+                        # Row exists but had no contact data – update in place
+                        self.db.conn.execute("""
+                            UPDATE projects
+                            SET contact_first_name = ?,
+                                contact_last_name  = ?,
+                                contact_email      = ?,
+                                contact_phone      = ?,
+                                company_website    = ?
+                            WHERE link = ?
+                        """, (
+                            contact_first_name, contact_last_name,
+                            contact_email, contact_phone, company_website,
+                            link,
+                        ))
+                        print(f"  Kontakt aktualisiert: {link[:80]}")
+                    else:
+                        self.db.conn.execute("""
+                            INSERT OR IGNORE INTO projects
+                            (title, link, company, description, keywords,
+                            created_date, is_top_project, is_endcustomer,
+                            contact_first_name, contact_last_name,
+                            contact_email, contact_phone, company_website)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            project['titel'],
+                            link,
+                            project['firma'],
+                            project['beschreibung'],
+                            project['keywords'],
+                            project['eintragungsdatum'],
+                            project['ist_top_projekt'],
+                            project['ist_endkundenprojekt'],
+                            contact_first_name,
+                            contact_last_name,
+                            contact_email,
+                            contact_phone,
+                            company_website,
+                        ))
                     time.sleep(random.uniform(0.5, 1.2))
 
                 self.db.conn.commit()
