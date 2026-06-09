@@ -833,6 +833,17 @@ class MainWindow(QMainWindow):
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        # Migrate older databases that predate contact/company columns
+        for _tbl in ('projects', 'matches'):
+            _existing = {row[1] for row in conn.execute(f"PRAGMA table_info({_tbl})")}
+            for _col in ('contact_name', 'contact_first_name', 'contact_last_name',
+                         'contact_email', 'contact_phone', 'company_website'):
+                if _col not in _existing:
+                    try:
+                        conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} TEXT")
+                    except Exception:
+                        pass
+        conn.commit()
 
         matching_enabled = self.config.get('matching_enabled', True)
         self._filter_score.setEnabled(matching_enabled)
