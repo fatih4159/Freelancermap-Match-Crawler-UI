@@ -839,40 +839,78 @@ class FreelancermapScraper:
             attrs={'data-component-name': 'ProjectShow', 'type': 'application/json'},
         )
         if not script:
+            print("  [debug] Kein ProjectShow-JSON-Block gefunden")
             return None, None, None, None, None
         try:
-            proj = json.loads(script.string or '').get('project', {})
-            first = (proj.get('firstName') or '').strip() or None
-            last  = (proj.get('lastName')  or '').strip() or None
-            email = proj.get('contactEmail') or proj.get('email') or None
-            phone = proj.get('contactPhone') or proj.get('phone') or None
-            # companyUrl is a relative path, e.g. /firma/831-red-sap-...
-            company_url = proj.get('companyUrl') or None
+            raw = json.loads(script.string or '')
+            # Try common top-level wrappers
+            proj = (
+                raw.get('project')
+                or raw.get('initialProject')
+                or (raw.get('initialData') or {}).get('project')
+                or raw
+            )
+            if not isinstance(proj, dict):
+                print(f"  [debug] ProjectShow-Block hat unerwartete Struktur: {type(proj)}")
+                return None, None, None, None, None
+
+            # firstName/lastName may live directly or under a contact/poster sub-object
+            contact = proj.get('contact') or proj.get('poster') or proj.get('user') or {}
+            first = (
+                (proj.get('firstName') or contact.get('firstName') or
+                 contact.get('first_name') or '').strip() or None
+            )
+            last = (
+                (proj.get('lastName') or contact.get('lastName') or
+                 contact.get('last_name') or '').strip() or None
+            )
+            email = (
+                proj.get('contactEmail') or proj.get('email') or
+                contact.get('email') or contact.get('contactEmail') or None
+            )
+            phone = (
+                proj.get('contactPhone') or proj.get('phone') or
+                contact.get('phone') or contact.get('contactPhone') or None
+            )
+            company_url = proj.get('companyUrl') or contact.get('companyUrl') or None
+
+            print(f"  [debug] ProjectShow → first={first!r} last={last!r} "
+                  f"email={email!r} phone={phone!r} companyUrl={company_url!r}")
             return first, last, email, phone, company_url
-        except Exception:
+        except Exception as ex:
+            print(f"  [debug] Fehler beim Parsen des ProjectShow-Blocks: {ex}")
             return None, None, None, None, None
 
     @staticmethod
     def _parse_company_show(soup):
         """Return (email, phone, website) from the CompanyShow React-on-Rails
-        JSON block on a /firma/… page, or (None,…) if not found.
-
-        companyInfo structure (confirmed from real page):
-          { "phone": "+49 89 …", "email": "x@y.de", "website": "http://…", … }
-        """
+        JSON block on a /firma/… page, or (None,…) if not found."""
         script = soup.find(
             'script',
             attrs={'data-component-name': 'CompanyShow', 'type': 'application/json'},
         )
         if not script:
+            print("  [debug] Kein CompanyShow-JSON-Block gefunden")
             return None, None, None
         try:
-            info = json.loads(script.string or '').get('companyInfo', {})
+            raw = json.loads(script.string or '')
+            # companyInfo may be nested or at top level
+            info = (
+                raw.get('companyInfo')
+                or raw.get('company')
+                or (raw.get('initialData') or {}).get('company')
+                or raw
+            )
+            if not isinstance(info, dict):
+                print(f"  [debug] CompanyShow hat unerwartete Struktur: {type(info)}")
+                return None, None, None
             email   = info.get('email')   or None
             phone   = info.get('phone')   or None
-            website = info.get('website') or None
+            website = info.get('website') or info.get('companyUrl') or None
+            print(f"  [debug] CompanyShow → email={email!r} phone={phone!r} website={website!r}")
             return email, phone, website
-        except Exception:
+        except Exception as ex:
+            print(f"  [debug] Fehler beim Parsen des CompanyShow-Blocks: {ex}")
             return None, None, None
 
     def _scrape_contact_from_detail(self, link):
@@ -892,11 +930,11 @@ class FreelancermapScraper:
         itemprop microdata in case the React blocks are absent.
         """
         if not link or link == 'N/A':
-            return None, None, None
+            return None, None, None, None, None
         try:
             page = self._ipage if self._interactive_mode else self._page
             if page is None or page.is_closed():
-                return None, None, None
+                return None, None, None, None, None
 
             # ── Step 1: project detail page ───────────────────────────────────
             page.goto(link, wait_until='domcontentloaded', timeout=20000)
