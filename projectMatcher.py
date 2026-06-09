@@ -50,9 +50,11 @@ class FreelancermapDatabase:
                 created_date DATETIME,
                 is_top_project BOOLEAN,
                 is_endcustomer BOOLEAN,
-                contact_name TEXT,
+                contact_first_name TEXT,
+                contact_last_name TEXT,
                 contact_email TEXT,
                 contact_phone TEXT,
+                company_website TEXT,
                 scrape_date DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -68,9 +70,11 @@ class FreelancermapDatabase:
                 created_date DATETIME,
                 is_top_project BOOLEAN,
                 is_endcustomer BOOLEAN,
-                contact_name TEXT,
+                contact_first_name TEXT,
+                contact_last_name TEXT,
                 contact_email TEXT,
                 contact_phone TEXT,
+                company_website TEXT,
                 match_score FLOAT,
                 match_debug TEXT,
                 match_date DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -81,13 +85,20 @@ class FreelancermapDatabase:
         self.conn.commit()
 
     def _migrate_contact_columns(self):
-        """Add contact columns to existing databases that predate this feature."""
+        """Add contact/company columns to existing databases that predate this feature."""
         for table in ('projects', 'matches'):
             existing = {
                 row[1]
                 for row in self.conn.execute(f"PRAGMA table_info({table})")
             }
-            for col in ('contact_name', 'contact_email', 'contact_phone'):
+            for col in (
+                'contact_name',        # legacy – kept for backwards compat reads
+                'contact_first_name',
+                'contact_last_name',
+                'contact_email',
+                'contact_phone',
+                'company_website',
+            ):
                 if col not in existing:
                     try:
                         self.conn.execute(
@@ -819,16 +830,66 @@ class FreelancermapScraper:
             print(f"Fehler beim Extrahieren der Karte: {e}")
             return None
 
-    def _scrape_contact_from_detail(self, link):
-        """Visit a project detail page and extract contact information.
+    @staticmethod
+    def _parse_project_show(soup):
+        """Return (first_name, last_name, contact_email, contact_phone, company_url)
+        from the ProjectShow React-on-Rails JSON block, or (None,…) if not found."""
+        script = soup.find(
+            'script',
+            attrs={'data-component-name': 'ProjectShow', 'type': 'application/json'},
+        )
+        if not script:
+            return None, None, None, None, None
+        try:
+            proj = json.loads(script.string or '').get('project', {})
+            first = (proj.get('firstName') or '').strip() or None
+            last  = (proj.get('lastName')  or '').strip() or None
+            email = proj.get('contactEmail') or proj.get('email') or None
+            phone = proj.get('contactPhone') or proj.get('phone') or None
+            # companyUrl is a relative path, e.g. /firma/831-red-sap-...
+            company_url = proj.get('companyUrl') or None
+            return first, last, email, phone, company_url
+        except Exception:
+            return None, None, None, None, None
 
-        Primary source: the React-on-Rails ``ProjectShow`` component JSON
-        embedded as ``<script data-component-name="ProjectShow" type="application/json">``.
-        That object contains ``firstName``, ``lastName`` and ``company`` at the
-        top level of its ``project`` key – reliably present regardless of login
-        state.  E-mail and phone are not exposed in the page HTML; they are
-        kept behind a login-gated API, so we only extract them if they
-        unexpectedly appear via ``mailto:``/``tel:`` links.
+    @staticmethod
+    def _parse_company_show(soup):
+        """Return (email, phone, website) from the CompanyShow React-on-Rails
+        JSON block on a /firma/… page, or (None,…) if not found.
+
+        companyInfo structure (confirmed from real page):
+          { "phone": "+49 89 …", "email": "x@y.de", "website": "http://…", … }
+        """
+        script = soup.find(
+            'script',
+            attrs={'data-component-name': 'CompanyShow', 'type': 'application/json'},
+        )
+        if not script:
+            return None, None, None
+        try:
+            info = json.loads(script.string or '').get('companyInfo', {})
+            email   = info.get('email')   or None
+            phone   = info.get('phone')   or None
+            website = info.get('website') or None
+            return email, phone, website
+        except Exception:
+            return None, None, None
+
+    def _scrape_contact_from_detail(self, link):
+        """Visit a project detail page (and optionally its company profile page)
+        to extract Ansprechpartner, e-mail and phone.
+
+        Step 1 – ProjectShow JSON on the project page:
+          • firstName  → contact_first_name  (stored separately)
+          • lastName   → contact_last_name
+          • companyUrl → path to the /firma/… profile page
+
+        Step 2 – CompanyShow JSON on the /firma/… page (if companyUrl present):
+          • companyInfo.email  → contact_email
+          • companyInfo.phone  → contact_phone
+
+        Fallbacks (steps 3-5) handle edge cases like mailto:/tel: links or
+        itemprop microdata in case the React blocks are absent.
         """
         if not link or link == 'N/A':
             return None, None, None
@@ -836,98 +897,97 @@ class FreelancermapScraper:
             page = self._ipage if self._interactive_mode else self._page
             if page is None or page.is_closed():
                 return None, None, None
+
+            # ── Step 1: project detail page ───────────────────────────────────
             page.goto(link, wait_until='domcontentloaded', timeout=20000)
             time.sleep(0.5)
-            html = page.content()
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = BeautifulSoup(page.content(), 'html.parser')
 
-            contact_name = None
-            contact_email = None
-            contact_phone = None
+            contact_first_name, contact_last_name, contact_email, contact_phone, company_url = \
+                self._parse_project_show(soup)
 
-            # ── 1. Primary: React-on-Rails ProjectShow JSON ──────────────────
-            show_script = soup.find(
-                'script',
-                attrs={'data-component-name': 'ProjectShow', 'type': 'application/json'},
-            )
-            if show_script:
-                try:
-                    data = json.loads(show_script.string or '')
-                    proj = data.get('project', data)
-                    if isinstance(proj, dict):
-                        first = (proj.get('firstName') or '').strip()
-                        last  = (proj.get('lastName')  or '').strip()
-                        full  = f"{first} {last}".strip()
-                        if full:
-                            contact_name = full
-                        # E-mail / phone rarely present here but check anyway
-                        contact_email = (
-                            proj.get('contactEmail') or proj.get('email') or None
-                        )
-                        contact_phone = (
-                            proj.get('contactPhone') or proj.get('phone') or None
-                        )
-                except Exception:
-                    pass
-
-            # ── 2. Fallback: any other application/json script block ──────────
-            if not contact_name:
-                for script in soup.find_all('script', type='application/json'):
-                    if script == show_script:
+            # Fallback: other application/json blocks on the same page
+            if not contact_first_name and not contact_last_name:
+                for s in soup.find_all('script', type='application/json'):
+                    if s.get('data-component-name') == 'ProjectShow':
                         continue
                     try:
-                        data = json.loads(script.string or '')
+                        proj = json.loads(s.string or '')
                         proj = (
-                            data.get('project')
-                            or data.get('initialProject')
-                            or (data.get('initialData') or {}).get('project')
-                            or data
+                            proj.get('project')
+                            or proj.get('initialProject')
+                            or (proj.get('initialData') or {}).get('project')
+                            or proj
                         )
                         if not isinstance(proj, dict):
                             continue
-                        first = (proj.get('firstName') or '').strip()
-                        last  = (proj.get('lastName')  or '').strip()
-                        full  = f"{first} {last}".strip()
-                        if full:
-                            contact_name = full
+                        if not contact_first_name:
+                            contact_first_name = (proj.get('firstName') or '').strip() or None
+                        if not contact_last_name:
+                            contact_last_name = (proj.get('lastName') or '').strip() or None
                         if not contact_email:
                             contact_email = proj.get('contactEmail') or proj.get('email')
                         if not contact_phone:
                             contact_phone = proj.get('contactPhone') or proj.get('phone')
-                        if contact_name:
+                        if not company_url:
+                            company_url = proj.get('companyUrl')
+                        if contact_first_name or contact_last_name:
                             break
                     except Exception:
                         pass
 
-            # ── 3. mailto: / tel: links (shown after login on some pages) ────
-            if not contact_email:
-                email_el = soup.find('a', href=re.compile(r'^mailto:', re.I))
-                if email_el:
-                    contact_email = email_el['href'].replace('mailto:', '').strip() or None
+            # ── Step 2: company profile page (/firma/…) ───────────────────────
+            company_website = None
+            if company_url and not (contact_email and contact_phone):
+                try:
+                    full_company_url = (
+                        f"{self.base_url}{company_url}"
+                        if company_url.startswith('/')
+                        else company_url
+                    )
+                    print(f"  → Firmenprofil: {full_company_url}")
+                    page.goto(full_company_url, wait_until='domcontentloaded', timeout=20000)
+                    time.sleep(0.5)
+                    company_soup = BeautifulSoup(page.content(), 'html.parser')
+                    c_email, c_phone, c_website = self._parse_company_show(company_soup)
+                    if not contact_email:
+                        contact_email = c_email
+                    if not contact_phone:
+                        contact_phone = c_phone
+                    company_website = c_website
+                except Exception as ex:
+                    print(f"  Firmenprofil-Fehler: {ex}")
 
-            if not contact_phone:
-                phone_el = soup.find('a', href=re.compile(r'^tel:', re.I))
-                if phone_el:
-                    contact_phone = phone_el['href'].replace('tel:', '').strip() or None
-
-            # ── 4. itemprop microdata ─────────────────────────────────────────
+            # ── Step 3: mailto: / tel: links ──────────────────────────────────
             if not contact_email:
-                e = soup.find(itemprop='email')
-                if e:
-                    contact_email = e.get_text(strip=True) or None
+                el = soup.find('a', href=re.compile(r'^mailto:', re.I))
+                if el:
+                    contact_email = el['href'].replace('mailto:', '').strip() or None
             if not contact_phone:
-                ph = soup.find(itemprop='telephone')
-                if ph:
-                    contact_phone = ph.get_text(strip=True) or None
+                el = soup.find('a', href=re.compile(r'^tel:', re.I))
+                if el:
+                    contact_phone = el['href'].replace('tel:', '').strip() or None
+
+            # ── Step 4: itemprop microdata ────────────────────────────────────
+            if not contact_email:
+                el = soup.find(itemprop='email')
+                if el:
+                    contact_email = el.get_text(strip=True) or None
+            if not contact_phone:
+                el = soup.find(itemprop='telephone')
+                if el:
+                    contact_phone = el.get_text(strip=True) or None
 
             return (
-                contact_name  or None,
-                contact_email or None,
-                contact_phone or None,
+                contact_first_name or None,
+                contact_last_name  or None,
+                contact_email      or None,
+                contact_phone      or None,
+                company_website    or None,
             )
         except Exception as ex:
             print(f"  Kontaktdaten-Fehler für {link}: {ex}")
-            return None, None, None
+            return None, None, None, None, None
 
     def scrape(self):
         try:
@@ -952,20 +1012,24 @@ class FreelancermapScraper:
                         # Project already in DB – skip detail scraping
                         continue
 
-                    # Scrape contact data from the detail page
-                    cname, cemail, cphone = self._scrape_contact_from_detail(link)
+                    # Scrape contact data from the detail page (+ company profile)
+                    cfirst, clast, cemail, cphone, cwebsite = \
+                        self._scrape_contact_from_detail(link)
 
                     # Prefer detail-scraped values over any from listing JSON
-                    contact_name  = cname  or project.get('ansprechpartner')
-                    contact_email = cemail or project.get('kontakt_email')
-                    contact_phone = cphone or project.get('kontakt_telefon')
+                    contact_first_name = cfirst
+                    contact_last_name  = clast
+                    contact_email      = cemail or project.get('kontakt_email')
+                    contact_phone      = cphone or project.get('kontakt_telefon')
+                    company_website    = cwebsite
 
                     self.db.conn.execute("""
                         INSERT OR IGNORE INTO projects
                         (title, link, company, description, keywords,
                         created_date, is_top_project, is_endcustomer,
-                        contact_name, contact_email, contact_phone)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        contact_first_name, contact_last_name,
+                        contact_email, contact_phone, company_website)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         project['titel'],
                         link,
@@ -975,9 +1039,11 @@ class FreelancermapScraper:
                         project['eintragungsdatum'],
                         project['ist_top_projekt'],
                         project['ist_endkundenprojekt'],
-                        contact_name,
+                        contact_first_name,
+                        contact_last_name,
                         contact_email,
                         contact_phone,
+                        company_website,
                     ))
                     time.sleep(random.uniform(0.5, 1.2))
 
@@ -1024,9 +1090,11 @@ class ProjectMatcher:
                     'created_date': row['created_date'],
                     'is_top_project': row['is_top_project'],
                     'is_endcustomer': row['is_endcustomer'],
-                    'contact_name': row.get('contact_name'),
+                    'contact_first_name': row.get('contact_first_name'),
+                    'contact_last_name': row.get('contact_last_name'),
                     'contact_email': row.get('contact_email'),
                     'contact_phone': row.get('contact_phone'),
+                    'company_website': row.get('company_website'),
                     'match_score': score,
                     'match_debug': debug
                 })
@@ -1036,15 +1104,17 @@ class ProjectMatcher:
                 INSERT INTO matches (
                     project_id, title, link, company, description, keywords,
                     created_date, is_top_project, is_endcustomer,
-                    contact_name, contact_email, contact_phone,
+                    contact_first_name, contact_last_name,
+                    contact_email, contact_phone, company_website,
                     match_score, match_debug
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 match['project_id'], match['title'], match['link'],
                 match['company'], match['description'], match['keywords'],
                 match['created_date'], match['is_top_project'],
                 match['is_endcustomer'],
-                match['contact_name'], match['contact_email'], match['contact_phone'],
+                match['contact_first_name'], match['contact_last_name'],
+                match['contact_email'], match['contact_phone'], match['company_website'],
                 match['match_score'], match['match_debug'],
             ))
         self.db.conn.commit()
@@ -1139,7 +1209,8 @@ class ProjectMatcher:
                 p.title, p.company, p.keywords, p.description,
                 p.created_date, p.link, p.is_top_project,
                 p.is_endcustomer,
-                p.contact_name, p.contact_email, p.contact_phone,
+                p.contact_first_name, p.contact_last_name,
+                p.contact_email, p.contact_phone, p.company_website,
                 m.match_score, m.match_debug
             FROM matches m
             JOIN projects p ON m.project_id = p.id

@@ -841,7 +841,8 @@ class MainWindow(QMainWindow):
             cur.execute('''
                 SELECT p.id, p.title, p.company, p.keywords, p.description,
                        p.created_date, p.link, p.is_top_project, p.is_endcustomer,
-                       p.contact_name, p.contact_email, p.contact_phone,
+                       p.contact_first_name, p.contact_last_name,
+                       p.contact_email, p.contact_phone, p.company_website,
                        m.match_score, m.match_debug
                 FROM matches m JOIN projects p ON m.project_id = p.id
                 WHERE m.match_score >= ?
@@ -859,7 +860,8 @@ class MainWindow(QMainWindow):
             cur.execute('''
                 SELECT id, title, company, keywords, description,
                        created_date, link, is_top_project, is_endcustomer,
-                       contact_name, contact_email, contact_phone
+                       contact_first_name, contact_last_name,
+                       contact_email, contact_phone, company_website
                 FROM projects
                 ORDER BY created_date DESC
             ''')
@@ -925,12 +927,15 @@ class MainWindow(QMainWindow):
             f"Keywords: {m['keywords']}",
         ]
         contact_parts = []
-        if m.get('contact_name'):
-            contact_parts.append(f"Ansprechpartner: {m['contact_name']}")
+        name_parts = ' '.join(filter(None, [m.get('contact_first_name'), m.get('contact_last_name')]))
+        if name_parts:
+            contact_parts.append(f"Ansprechpartner: {name_parts}")
         if m.get('contact_email'):
             contact_parts.append(f"E-Mail: <a href='mailto:{m['contact_email']}'>{m['contact_email']}</a>")
         if m.get('contact_phone'):
             contact_parts.append(f"Telefon: {m['contact_phone']}")
+        if m.get('company_website'):
+            contact_parts.append(f"Website: <a href='{m['company_website']}'>{m['company_website']}</a>")
         if contact_parts:
             lines += ['', '  '.join(contact_parts)]
         desc = (m.get('description') or '')[:350]
@@ -957,7 +962,7 @@ class MainWindow(QMainWindow):
             w = csv.writer(fh, delimiter=';')
             w.writerow(['Titel', 'Firma', 'Score', 'Keywords',
                         'Datum', 'Top-Projekt', 'Endkunde',
-                        'Ansprechpartner', 'E-Mail', 'Telefon', 'Link'])
+                        'Vorname', 'Nachname', 'E-Mail', 'Telefon', 'Firmen-Website', 'Link'])
             for m in self._matches:
                 w.writerow([
                     m['title'], m['company'],
@@ -965,9 +970,11 @@ class MainWindow(QMainWindow):
                     m['created_date'],
                     'Ja' if m.get('is_top_project') else 'Nein',
                     'Ja' if m.get('is_endcustomer') else 'Nein',
-                    m.get('contact_name') or '',
+                    m.get('contact_first_name') or '',
+                    m.get('contact_last_name') or '',
                     m.get('contact_email') or '',
                     m.get('contact_phone') or '',
+                    m.get('company_website') or '',
                     m['link'],
                 ])
         QMessageBox.information(self, 'Exportiert',
