@@ -820,7 +820,16 @@ class FreelancermapScraper:
             return None
 
     def _scrape_contact_from_detail(self, link):
-        """Visit a project detail page and extract contact information."""
+        """Visit a project detail page and extract contact information.
+
+        Primary source: the React-on-Rails ``ProjectShow`` component JSON
+        embedded as ``<script data-component-name="ProjectShow" type="application/json">``.
+        That object contains ``firstName``, ``lastName`` and ``company`` at the
+        top level of its ``project`` key – reliably present regardless of login
+        state.  E-mail and phone are not exposed in the page HTML; they are
+        kept behind a login-gated API, so we only extract them if they
+        unexpectedly appear via ``mailto:``/``tel:`` links.
+        """
         if not link or link == 'N/A':
             return None, None, None
         try:
@@ -836,113 +845,83 @@ class FreelancermapScraper:
             contact_email = None
             contact_phone = None
 
-            # Try JSON-LD / script data first
-            for script in soup.find_all('script', type='application/json'):
+            # ── 1. Primary: React-on-Rails ProjectShow JSON ──────────────────
+            show_script = soup.find(
+                'script',
+                attrs={'data-component-name': 'ProjectShow', 'type': 'application/json'},
+            )
+            if show_script:
                 try:
-                    data = json.loads(script.string or '')
-                    if isinstance(data, dict):
-                        props = data.get('props', data.get('pageProps', data))
-                        project = (
-                            props.get('project')
-                            or props.get('initialProject')
-                            or props.get('initialData', {}).get('project')
-                            or props
+                    data = json.loads(show_script.string or '')
+                    proj = data.get('project', data)
+                    if isinstance(proj, dict):
+                        first = (proj.get('firstName') or '').strip()
+                        last  = (proj.get('lastName')  or '').strip()
+                        full  = f"{first} {last}".strip()
+                        if full:
+                            contact_name = full
+                        # E-mail / phone rarely present here but check anyway
+                        contact_email = (
+                            proj.get('contactEmail') or proj.get('email') or None
                         )
-                        if isinstance(project, dict):
-                            poster = project.get('poster', {}) or {}
-                            contact_name = (
-                                project.get('contactName')
-                                or poster.get('name')
-                                or poster.get('fullName')
-                            )
-                            contact_email = (
-                                project.get('contactEmail')
-                                or poster.get('email')
-                            )
-                            contact_phone = (
-                                project.get('contactPhone')
-                                or poster.get('phone')
-                                or poster.get('phoneNumber')
-                            )
-                            if any([contact_name, contact_email, contact_phone]):
-                                break
+                        contact_phone = (
+                            proj.get('contactPhone') or proj.get('phone') or None
+                        )
                 except Exception:
                     pass
 
-            # Inline React SSR JSON
-            if not any([contact_name, contact_email, contact_phone]):
-                for script in soup.find_all('script'):
-                    txt = script.string or ''
-                    m = re.search(r'__NEXT_DATA__\s*=\s*(\{.*?\});?\s*</script', txt, re.S)
-                    if not m:
-                        m = re.search(r'window\.__reactProps\s*=\s*(\{.*?\});', txt, re.S)
-                    if m:
-                        try:
-                            data = json.loads(m.group(1))
-                            flat = json.dumps(data)
-                            for pattern, field in [
-                                (r'"contactName"\s*:\s*"([^"]+)"', 'name'),
-                                (r'"contactEmail"\s*:\s*"([^"]+)"', 'email'),
-                                (r'"contactPhone"\s*:\s*"([^"]+)"', 'phone'),
-                            ]:
-                                hit = re.search(pattern, flat)
-                                if hit:
-                                    if field == 'name':
-                                        contact_name = hit.group(1)
-                                    elif field == 'email':
-                                        contact_email = hit.group(1)
-                                    elif field == 'phone':
-                                        contact_phone = hit.group(1)
-                        except Exception:
-                            pass
+            # ── 2. Fallback: any other application/json script block ──────────
+            if not contact_name:
+                for script in soup.find_all('script', type='application/json'):
+                    if script == show_script:
+                        continue
+                    try:
+                        data = json.loads(script.string or '')
+                        proj = (
+                            data.get('project')
+                            or data.get('initialProject')
+                            or (data.get('initialData') or {}).get('project')
+                            or data
+                        )
+                        if not isinstance(proj, dict):
+                            continue
+                        first = (proj.get('firstName') or '').strip()
+                        last  = (proj.get('lastName')  or '').strip()
+                        full  = f"{first} {last}".strip()
+                        if full:
+                            contact_name = full
+                        if not contact_email:
+                            contact_email = proj.get('contactEmail') or proj.get('email')
+                        if not contact_phone:
+                            contact_phone = proj.get('contactPhone') or proj.get('phone')
+                        if contact_name:
+                            break
+                    except Exception:
+                        pass
 
-            # HTML DOM fallback
-            if not any([contact_name, contact_email, contact_phone]):
-                # Ansprechpartner block
-                contact_block = soup.find(
-                    lambda t: t.name in ('div', 'section', 'aside')
-                    and re.search(r'contact|ansprechpartner|kontakt', t.get('class', [''])[0] if t.get('class') else '', re.I)
-                )
-                if not contact_block:
-                    contact_block = soup.find(
-                        string=re.compile(r'Ansprechpartner|Kontaktperson', re.I)
-                    )
-                    if contact_block:
-                        contact_block = contact_block.find_parent(['div', 'section', 'li'])
-
-                if contact_block:
-                    name_el = contact_block.find(
-                        class_=re.compile(r'name|person|author', re.I)
-                    )
-                    if name_el:
-                        contact_name = name_el.get_text(strip=True) or None
-
-                # Email link
-                email_el = soup.find('a', href=re.compile(r'^mailto:'))
+            # ── 3. mailto: / tel: links (shown after login on some pages) ────
+            if not contact_email:
+                email_el = soup.find('a', href=re.compile(r'^mailto:', re.I))
                 if email_el:
                     contact_email = email_el['href'].replace('mailto:', '').strip() or None
 
-                # Phone link
-                phone_el = soup.find('a', href=re.compile(r'^tel:'))
+            if not contact_phone:
+                phone_el = soup.find('a', href=re.compile(r'^tel:', re.I))
                 if phone_el:
                     contact_phone = phone_el['href'].replace('tel:', '').strip() or None
 
-                # Fallback: itemprop
-                if not contact_name:
-                    n = soup.find(itemprop='name')
-                    if n:
-                        contact_name = n.get_text(strip=True) or None
-                if not contact_email:
-                    e = soup.find(itemprop='email')
-                    if e:
-                        contact_email = e.get_text(strip=True) or None
-                if not contact_phone:
-                    ph = soup.find(itemprop='telephone')
-                    if ph:
-                        contact_phone = ph.get_text(strip=True) or None
+            # ── 4. itemprop microdata ─────────────────────────────────────────
+            if not contact_email:
+                e = soup.find(itemprop='email')
+                if e:
+                    contact_email = e.get_text(strip=True) or None
+            if not contact_phone:
+                ph = soup.find(itemprop='telephone')
+                if ph:
+                    contact_phone = ph.get_text(strip=True) or None
 
             return (
-                contact_name or None,
+                contact_name  or None,
                 contact_email or None,
                 contact_phone or None,
             )
