@@ -51,16 +51,21 @@ def index():
 
     # Fetch matches with pagination
     cur.execute("""
-        SELECT 
-            p.title, 
-            p.company, 
-            p.keywords, 
-            substr(p.description, 1, 300) as description, 
-            p.created_date, 
-            p.link, 
+        SELECT
+            p.title,
+            p.company,
+            p.keywords,
+            substr(p.description, 1, 300) as description,
+            p.created_date,
+            p.link,
             p.is_top_project,
-            p.is_endcustomer, 
-            m.match_score, 
+            p.is_endcustomer,
+            p.contact_first_name,
+            p.contact_last_name,
+            p.contact_email,
+            p.contact_phone,
+            p.company_website,
+            m.match_score,
             m.match_debug
         FROM matches m
         JOIN projects p ON m.project_id = p.id
@@ -255,8 +260,16 @@ def create_templates():
             <p><strong>Firma:</strong> {{ match['company'] }}</p>
             <p><strong>Keywords:</strong> {{ match['keywords'] }}</p>
             <p>{{ match['description'] }}...</p>
+            {% if match['contact_first_name'] or match['contact_last_name'] or match['contact_email'] or match['contact_phone'] or match['company_website'] %}
             <p>
-                <strong>Eingetragen:</strong> {{ match['created_date'] }} | 
+                {% if match['contact_first_name'] or match['contact_last_name'] %}<strong>Ansprechpartner:</strong> {{ match['contact_first_name'] or '' }} {{ match['contact_last_name'] or '' }}{% endif %}
+                {% if match['contact_email'] %} &nbsp;|&nbsp; <strong>E-Mail:</strong> <a href="mailto:{{ match['contact_email'] }}">{{ match['contact_email'] }}</a>{% endif %}
+                {% if match['contact_phone'] %} &nbsp;|&nbsp; <strong>Telefon:</strong> {{ match['contact_phone'] }}{% endif %}
+                {% if match['company_website'] %} &nbsp;|&nbsp; <strong>Website:</strong> <a href="{{ match['company_website'] }}" target="_blank">{{ match['company_website'] }}</a>{% endif %}
+            </p>
+            {% endif %}
+            <p>
+                <strong>Eingetragen:</strong> {{ match['created_date'] }} |
                 <strong>Match Score:</strong> {{ match['match_score']|round(2) }}
             </p>
         </div>
@@ -294,7 +307,14 @@ def create_templates():
             <p><strong>Keywords:</strong> {{ project['keywords'] }}</p>
             <p><strong>Beschreibung:</strong> {{ project['description'] }}</p>
             <p><strong>Eingetragen:</strong> {{ project['created_date'] }}</p>
-            
+            {% if project['contact_first_name'] or project['contact_last_name'] or project['contact_email'] or project['contact_phone'] or project['company_website'] %}
+            <h3>Kontaktdaten</h3>
+            {% if project['contact_first_name'] or project['contact_last_name'] %}<p><strong>Vorname:</strong> {{ project['contact_first_name'] or '–' }} &nbsp; <strong>Nachname:</strong> {{ project['contact_last_name'] or '–' }}</p>{% endif %}
+            {% if project['contact_email'] %}<p><strong>E-Mail:</strong> <a href="mailto:{{ project['contact_email'] }}">{{ project['contact_email'] }}</a></p>{% endif %}
+            {% if project['contact_phone'] %}<p><strong>Telefon:</strong> {{ project['contact_phone'] }}</p>{% endif %}
+            {% if project['company_website'] %}<p><strong>Website:</strong> <a href="{{ project['company_website'] }}" target="_blank">{{ project['company_website'] }}</a></p>{% endif %}
+            {% endif %}
+
             <h3>Match Details</h3>
             <p><strong>Match Score:</strong> {{ project['match_score']|round(2) }}</p>
             <pre>{{ project['match_debug'] }}</pre>

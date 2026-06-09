@@ -50,6 +50,11 @@ class FreelancermapDatabase:
                 created_date DATETIME,
                 is_top_project BOOLEAN,
                 is_endcustomer BOOLEAN,
+                contact_first_name TEXT,
+                contact_last_name TEXT,
+                contact_email TEXT,
+                contact_phone TEXT,
+                company_website TEXT,
                 scrape_date DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -65,13 +70,42 @@ class FreelancermapDatabase:
                 created_date DATETIME,
                 is_top_project BOOLEAN,
                 is_endcustomer BOOLEAN,
+                contact_first_name TEXT,
+                contact_last_name TEXT,
+                contact_email TEXT,
+                contact_phone TEXT,
+                company_website TEXT,
                 match_score FLOAT,
                 match_debug TEXT,
                 match_date DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(project_id) REFERENCES projects(id)
             )
         """)
+        self._migrate_contact_columns()
         self.conn.commit()
+
+    def _migrate_contact_columns(self):
+        """Add contact/company columns to existing databases that predate this feature."""
+        for table in ('projects', 'matches'):
+            existing = {
+                row[1]
+                for row in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+            for col in (
+                'contact_name',        # legacy – kept for backwards compat reads
+                'contact_first_name',
+                'contact_last_name',
+                'contact_email',
+                'contact_phone',
+                'company_website',
+            ):
+                if col not in existing:
+                    try:
+                        self.conn.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {col} TEXT"
+                        )
+                    except Exception:
+                        pass
 
 
 class FreelancermapScraper:
@@ -678,6 +712,30 @@ class FreelancermapScraper:
 
             is_endcustomer = bool(p.get('endcustomer'))
 
+            # Contact info: try poster object and top-level contact fields
+            poster = p.get('poster', {}) or {}
+            contact_name = (
+                p.get('contactName')
+                or p.get('contact_name')
+                or poster.get('name')
+                or poster.get('fullName')
+                or poster.get('contactName')
+                or None
+            )
+            contact_email = (
+                p.get('contactEmail')
+                or p.get('contact_email')
+                or poster.get('email')
+                or None
+            )
+            contact_phone = (
+                p.get('contactPhone')
+                or p.get('contact_phone')
+                or poster.get('phone')
+                or poster.get('phoneNumber')
+                or None
+            )
+
             return {
                 'titel': title,
                 'link': link,
@@ -687,6 +745,9 @@ class FreelancermapScraper:
                 'eintragungsdatum': created_date,
                 'ist_top_projekt': is_top_project,
                 'ist_endkundenprojekt': is_endcustomer,
+                'ansprechpartner': contact_name,
+                'kontakt_email': contact_email,
+                'kontakt_telefon': contact_phone,
             }
         except Exception as e:
             print(f"Fehler beim Parsen des JSON-Projekts: {e}")
@@ -761,10 +822,172 @@ class FreelancermapScraper:
                 'eintragungsdatum': created_date,
                 'ist_top_projekt': is_top,
                 'ist_endkundenprojekt': is_endcustomer,
+                'ansprechpartner': None,
+                'kontakt_email': None,
+                'kontakt_telefon': None,
             }
         except Exception as e:
             print(f"Fehler beim Extrahieren der Karte: {e}")
             return None
+
+    @staticmethod
+    def _parse_project_show(soup):
+        """Return (first_name, last_name, contact_email, contact_phone, company_url)
+        from the ProjectShow React-on-Rails JSON block, or (None,…) if not found."""
+        script = soup.find(
+            'script',
+            attrs={'data-component-name': 'ProjectShow', 'type': 'application/json'},
+        )
+        if not script:
+            return None, None, None, None, None
+        try:
+            proj = json.loads(script.string or '').get('project', {})
+            first = (proj.get('firstName') or '').strip() or None
+            last  = (proj.get('lastName')  or '').strip() or None
+            email = proj.get('contactEmail') or proj.get('email') or None
+            phone = proj.get('contactPhone') or proj.get('phone') or None
+            # companyUrl is a relative path, e.g. /firma/831-red-sap-...
+            company_url = proj.get('companyUrl') or None
+            return first, last, email, phone, company_url
+        except Exception:
+            return None, None, None, None, None
+
+    @staticmethod
+    def _parse_company_show(soup):
+        """Return (email, phone, website) from the CompanyShow React-on-Rails
+        JSON block on a /firma/… page, or (None,…) if not found.
+
+        companyInfo structure (confirmed from real page):
+          { "phone": "+49 89 …", "email": "x@y.de", "website": "http://…", … }
+        """
+        script = soup.find(
+            'script',
+            attrs={'data-component-name': 'CompanyShow', 'type': 'application/json'},
+        )
+        if not script:
+            return None, None, None
+        try:
+            info = json.loads(script.string or '').get('companyInfo', {})
+            email   = info.get('email')   or None
+            phone   = info.get('phone')   or None
+            website = info.get('website') or None
+            return email, phone, website
+        except Exception:
+            return None, None, None
+
+    def _scrape_contact_from_detail(self, link):
+        """Visit a project detail page (and optionally its company profile page)
+        to extract Ansprechpartner, e-mail and phone.
+
+        Step 1 – ProjectShow JSON on the project page:
+          • firstName  → contact_first_name  (stored separately)
+          • lastName   → contact_last_name
+          • companyUrl → path to the /firma/… profile page
+
+        Step 2 – CompanyShow JSON on the /firma/… page (if companyUrl present):
+          • companyInfo.email  → contact_email
+          • companyInfo.phone  → contact_phone
+
+        Fallbacks (steps 3-5) handle edge cases like mailto:/tel: links or
+        itemprop microdata in case the React blocks are absent.
+        """
+        if not link or link == 'N/A':
+            return None, None, None
+        try:
+            page = self._ipage if self._interactive_mode else self._page
+            if page is None or page.is_closed():
+                return None, None, None
+
+            # ── Step 1: project detail page ───────────────────────────────────
+            page.goto(link, wait_until='domcontentloaded', timeout=20000)
+            time.sleep(0.5)
+            soup = BeautifulSoup(page.content(), 'html.parser')
+
+            contact_first_name, contact_last_name, contact_email, contact_phone, company_url = \
+                self._parse_project_show(soup)
+
+            # Fallback: other application/json blocks on the same page
+            if not contact_first_name and not contact_last_name:
+                for s in soup.find_all('script', type='application/json'):
+                    if s.get('data-component-name') == 'ProjectShow':
+                        continue
+                    try:
+                        proj = json.loads(s.string or '')
+                        proj = (
+                            proj.get('project')
+                            or proj.get('initialProject')
+                            or (proj.get('initialData') or {}).get('project')
+                            or proj
+                        )
+                        if not isinstance(proj, dict):
+                            continue
+                        if not contact_first_name:
+                            contact_first_name = (proj.get('firstName') or '').strip() or None
+                        if not contact_last_name:
+                            contact_last_name = (proj.get('lastName') or '').strip() or None
+                        if not contact_email:
+                            contact_email = proj.get('contactEmail') or proj.get('email')
+                        if not contact_phone:
+                            contact_phone = proj.get('contactPhone') or proj.get('phone')
+                        if not company_url:
+                            company_url = proj.get('companyUrl')
+                        if contact_first_name or contact_last_name:
+                            break
+                    except Exception:
+                        pass
+
+            # ── Step 2: company profile page (/firma/…) ───────────────────────
+            company_website = None
+            if company_url and not (contact_email and contact_phone):
+                try:
+                    full_company_url = (
+                        f"{self.base_url}{company_url}"
+                        if company_url.startswith('/')
+                        else company_url
+                    )
+                    print(f"  → Firmenprofil: {full_company_url}")
+                    page.goto(full_company_url, wait_until='domcontentloaded', timeout=20000)
+                    time.sleep(0.5)
+                    company_soup = BeautifulSoup(page.content(), 'html.parser')
+                    c_email, c_phone, c_website = self._parse_company_show(company_soup)
+                    if not contact_email:
+                        contact_email = c_email
+                    if not contact_phone:
+                        contact_phone = c_phone
+                    company_website = c_website
+                except Exception as ex:
+                    print(f"  Firmenprofil-Fehler: {ex}")
+
+            # ── Step 3: mailto: / tel: links ──────────────────────────────────
+            if not contact_email:
+                el = soup.find('a', href=re.compile(r'^mailto:', re.I))
+                if el:
+                    contact_email = el['href'].replace('mailto:', '').strip() or None
+            if not contact_phone:
+                el = soup.find('a', href=re.compile(r'^tel:', re.I))
+                if el:
+                    contact_phone = el['href'].replace('tel:', '').strip() or None
+
+            # ── Step 4: itemprop microdata ────────────────────────────────────
+            if not contact_email:
+                el = soup.find(itemprop='email')
+                if el:
+                    contact_email = el.get_text(strip=True) or None
+            if not contact_phone:
+                el = soup.find(itemprop='telephone')
+                if el:
+                    contact_phone = el.get_text(strip=True) or None
+
+            return (
+                contact_first_name or None,
+                contact_last_name  or None,
+                contact_email      or None,
+                contact_phone      or None,
+                company_website    or None,
+            )
+        except Exception as ex:
+            print(f"  Kontaktdaten-Fehler für {link}: {ex}")
+            return None, None, None, None, None
 
     def scrape(self):
         try:
@@ -777,21 +1000,53 @@ class FreelancermapScraper:
                     break
 
                 for project in projects:
+                    link = project['link']
+
+                    # Only scrape detail page for newly inserted rows
+                    cur = self.db.conn.execute(
+                        "SELECT id FROM projects WHERE link = ?", (link,)
+                    )
+                    existing = cur.fetchone()
+
+                    if existing:
+                        # Project already in DB – skip detail scraping
+                        continue
+
+                    # Scrape contact data from the detail page (+ company profile)
+                    cfirst, clast, cemail, cphone, cwebsite = \
+                        self._scrape_contact_from_detail(link)
+
+                    # Prefer detail-scraped values over any from listing JSON
+                    contact_first_name = cfirst
+                    contact_last_name  = clast
+                    contact_email      = cemail or project.get('kontakt_email')
+                    contact_phone      = cphone or project.get('kontakt_telefon')
+                    company_website    = cwebsite
+
                     self.db.conn.execute("""
                         INSERT OR IGNORE INTO projects
                         (title, link, company, description, keywords,
-                        created_date, is_top_project, is_endcustomer)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        created_date, is_top_project, is_endcustomer,
+                        contact_first_name, contact_last_name,
+                        contact_email, contact_phone, company_website)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         project['titel'],
-                        project['link'],
+                        link,
                         project['firma'],
                         project['beschreibung'],
                         project['keywords'],
                         project['eintragungsdatum'],
                         project['ist_top_projekt'],
-                        project['ist_endkundenprojekt']
+                        project['ist_endkundenprojekt'],
+                        contact_first_name,
+                        contact_last_name,
+                        contact_email,
+                        contact_phone,
+                        company_website,
                     ))
+                    time.sleep(random.uniform(0.5, 1.2))
+
                 self.db.conn.commit()
 
                 if page < self.max_pages:
@@ -835,6 +1090,11 @@ class ProjectMatcher:
                     'created_date': row['created_date'],
                     'is_top_project': row['is_top_project'],
                     'is_endcustomer': row['is_endcustomer'],
+                    'contact_first_name': row.get('contact_first_name'),
+                    'contact_last_name': row.get('contact_last_name'),
+                    'contact_email': row.get('contact_email'),
+                    'contact_phone': row.get('contact_phone'),
+                    'company_website': row.get('company_website'),
                     'match_score': score,
                     'match_debug': debug
                 })
@@ -844,14 +1104,18 @@ class ProjectMatcher:
                 INSERT INTO matches (
                     project_id, title, link, company, description, keywords,
                     created_date, is_top_project, is_endcustomer,
+                    contact_first_name, contact_last_name,
+                    contact_email, contact_phone, company_website,
                     match_score, match_debug
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 match['project_id'], match['title'], match['link'],
                 match['company'], match['description'], match['keywords'],
                 match['created_date'], match['is_top_project'],
-                match['is_endcustomer'], match['match_score'],
-                match['match_debug']
+                match['is_endcustomer'],
+                match['contact_first_name'], match['contact_last_name'],
+                match['contact_email'], match['contact_phone'], match['company_website'],
+                match['match_score'], match['match_debug'],
             ))
         self.db.conn.commit()
 
@@ -944,7 +1208,10 @@ class ProjectMatcher:
             SELECT
                 p.title, p.company, p.keywords, p.description,
                 p.created_date, p.link, p.is_top_project,
-                p.is_endcustomer, m.match_score, m.match_debug
+                p.is_endcustomer,
+                p.contact_first_name, p.contact_last_name,
+                p.contact_email, p.contact_phone, p.company_website,
+                m.match_score, m.match_debug
             FROM matches m
             JOIN projects p ON m.project_id = p.id
             WHERE m.match_score >= ?
