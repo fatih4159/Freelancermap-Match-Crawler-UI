@@ -37,6 +37,7 @@ class FreelancermapDatabase:
     def __init__(self, db_path="freelancermap.db"):
         self.conn = sqlite3.connect(db_path)
         self.create_tables()
+        self._migrate_contact_columns()
 
     def create_tables(self):
         self.conn.execute("""
@@ -930,13 +931,17 @@ class FreelancermapScraper:
         itemprop microdata in case the React blocks are absent.
         """
         if not link or link == 'N/A':
+            print(f"  [debug] Kein gültiger Link – überspringe Kontakt-Scraping")
             return None, None, None, None, None
         try:
             page = self._ipage if self._interactive_mode else self._page
             if page is None or page.is_closed():
+                print(f"  [debug] Browser-Seite nicht verfügbar (None oder geschlossen) – "
+                      f"interactive_mode={self._interactive_mode}")
                 return None, None, None, None, None
 
             # ── Step 1: project detail page ───────────────────────────────────
+            print(f"  [debug] Lade Detailseite: {link[:100]}")
             page.goto(link, wait_until='domcontentloaded', timeout=20000)
             time.sleep(0.5)
             soup = BeautifulSoup(page.content(), 'html.parser')
